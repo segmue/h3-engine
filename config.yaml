@@ -1,0 +1,56 @@
+# =============================================================================
+# H3 Multi-Datensatz Converter -- Konfiguration
+# =============================================================================
+# Verwendet von: scripts/convert_h3_multi.py
+# Das Skript liest diese Datei beim Start und fragt, ob die Defaults
+# verwendet werden sollen. Bei "n" werden alle Werte interaktiv eingegeben.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Input-Datensätze
+# -----------------------------------------------------------------------------
+# Liste von Geodaten-Dateien die zusammengefuegt werden.
+# Alle Dateien muessen das gleiche Schema haben (Spalten werden appended).
+# Pfade relativ zum Verzeichnis von dem aus das Skript ausgefuehrt wird.
+# -----------------------------------------------------------------------------
+input_files:
+  - data/swissNAMES3D_PLY.shp
+  - data/swissNAMES3D_LIN.shp
+  - data/swissNAMES3D_PKT.shp
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+# Ausgabedatei im GPKG-Format.
+# Enthält alle zusammengefügten Zeilen + H3-Spalten.
+# -----------------------------------------------------------------------------
+output_file: data/swissNAMES3D_combined_h3.gpkg
+
+# -----------------------------------------------------------------------------
+# H3 Konvertierungsparameter
+# -----------------------------------------------------------------------------
+
+# Ziel-Anzahl H3-Cells pro Geometrie.
+# Nur relevant fuer Polygone / MultiPolygone (adaptive Resolution).
+# Punkte und Linien verwenden immer max_resolution.
+target_cells: 100
+
+# Minimale H3-Resolution fuer die adaptive Aufloesung (Polygone).
+# Grosse Polygone werden hier "eingedeckt" -- Resolution wird nicht
+# unter diesen Wert gedrückt.
+min_resolution: 5
+
+# Maximale H3-Resolution.
+#   - Polygone/MultiPolygone: obere Grenze der adaptiven Aufloesung.
+#     Sehr kleine Polygone fallen auf die Centroid-Methode bei dieser Resolution.
+#   - Punkte / Linien / MultiPoints / MultiLines: wird direkt verwendet.
+max_resolution: 15
+
+# Containment-Modus fuer die Polygon-zu-H3 Konvertierung.
+# Bestimmt, welche Zellen als "gehoerend zum Polygon" gelten.
+#
+#   center:       Nur Zellen, deren Mittelpunkt im Polygon liegt (klassisch)
+#   full:         Nur Zellen, die vollstaendig im Polygon liegen
+#   overlap:      Jede Ueberschneidung zaehlt (empfohlen, volle Abdeckung)
+#   overlap_bbox: Bounding-Box Ueberschneidung (schneller, aber gröber)
+containment_mode: overlap

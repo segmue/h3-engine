@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "dggs-tests"
+version = "0.1.0"
+description = "Vector to DGGS (H3, S2) conversion and spatial operations for master thesis"
+authors = ["Your Name <your.email@example.com>"]
+readme = "readme.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+h3 = "^4.0.0"
+s2sphere = "^0.2.5"
+shapely = "^2.0.0"
+geopandas = "^1.0.0"
+pyproj = "^3.6.0"
+pyyaml = "^6.0"
+folium = "^0.18.0"
+matplotlib = "^3.8.0"
+jupyter = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-cov = "^5.0.0"
+ipykernel = "^7.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
