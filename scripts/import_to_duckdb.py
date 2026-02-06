@@ -10,6 +10,11 @@ Die H3 Cells werden als Array (UBIGINT[]) gespeichert. Parent-Cells fuer
 verschiedene Resolution-Levels werden zur Query-Zeit berechnet via
 DuckDB H3 Extension (h3_cell_to_parent).
 
+Der Import nutzt DuckDB's Bulk-Operationen: Das GeoDataFrame wird als
+temporaere View registriert und per INSERT INTO ... SELECT in einem
+einzigen Schritt transformiert und eingefuegt. Die H3-String-Konvertierung
+(str_split + h3_string_to_h3) laeuft vektorisiert in DuckDB statt in Python.
+
 Verwendung:
     python scripts/import_to_duckdb.py
 """
@@ -20,7 +25,7 @@ from pathlib import Path
 
 import duckdb
 import geopandas as gpd
-import h3
+import pandas as pd
 import yaml
 
 # Projektverzeichnis zum Importpfad hinzufuegen
@@ -99,46 +104,84 @@ def create_tables(conn: duckdb.DuckDBPyConnection, sample_gdf: gpd.GeoDataFrame)
 # ---------------------------------------------------------------------------
 
 
+def prepare_dataframe(gdf: gpd.GeoDataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    Bereitet ein GeoDataFrame fuer DuckDB Bulk-Import vor.
+
+    Konvertiert Geometrien zu WKB-Bytes und behaelt h3_cells als Rohstring.
+    Die eigentliche H3-String-Konvertierung passiert spaeter in DuckDB (vektorisiert).
+
+    Returns:
+        (DataFrame, insert_columns, select_expressions)
+    """
+    df = pd.DataFrame({"feature_id": range(len(gdf))})
+
+    insert_cols = ["feature_id"]
+    select_exprs = ["feature_id"]
+
+    for col in gdf.columns:
+        if col == "geometry":
+            # Geometrie → WKB Bytes (einzige Python-Iteration, aber in C via Shapely)
+            df["geometry"] = gdf.geometry.apply(lambda g: g.wkb if g else None)
+            insert_cols.append("geometry")
+            select_exprs.append("geometry")
+
+        elif col == "h3_cells":
+            # Als Rohstring behalten → DuckDB konvertiert vektorisiert
+            df["h3_cells_raw"] = gdf["h3_cells"].fillna("")
+            insert_cols.append("h3_cells")
+            select_exprs.append(
+                "CASE WHEN h3_cells_raw = '' THEN []::UBIGINT[] "
+                "ELSE list_transform("
+                "  list_filter(str_split(h3_cells_raw, ';'), x -> x != ''),"
+                "  x -> h3_string_to_h3(x)"
+                ") END AS h3_cells"
+            )
+
+        else:
+            df[col] = gdf[col]
+            insert_cols.append(f'"{col}"')
+            select_exprs.append(f'"{col}"')
+
+    return df, insert_cols, select_exprs
+
+
 def import_features(conn: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFrame) -> None:
-    """Importiert alle Features inkl. H3 Cells als Array."""
-    print(f"   Importiere {len(gdf)} Features...")
+    """Bulk-importiert alle Features inkl. H3 Cells als Array.
 
-    total_cells = 0
-    cols_to_insert = list(gdf.columns)
+    Statt Zeile-fuer-Zeile INSERT wird das DataFrame bei DuckDB registriert
+    und per INSERT INTO ... SELECT in einem Schritt transformiert:
+    - str_split() spaltet die Semikolon-getrennten H3-Strings
+    - h3_string_to_h3() konvertiert jeden String zu UBIGINT
+    - Alles vektorisiert in DuckDB, kein Python-Loop noetig
+    """
+    print(f"   Bereite {len(gdf):,} Features vor...")
+    start = time.time()
 
-    for idx, row in gdf.iterrows():
-        values = [idx]  # feature_id
-        placeholders = ["?"]
+    df, insert_cols, select_exprs = prepare_dataframe(gdf)
 
-        for col in cols_to_insert:
-            if col == "geometry":
-                # Geometrie als WKB
-                values.append(row.geometry.wkb)
-            elif col == "h3_cells":
-                # Semikolon-getrennte Cells → UBIGINT Array
-                cells_str = row["h3_cells"]
-                if cells_str:
-                    cells = [h3.str_to_int(c) for c in cells_str.split(";") if c]
-                else:
-                    cells = []
-                values.append(cells)
-                total_cells += len(cells)
-            else:
-                values.append(row[col])
-            placeholders.append("?")
+    print(f"   DataFrame vorbereitet in {time.time() - start:.1f}s")
+    print(f"   Starte DuckDB Bulk-Import...")
+    start = time.time()
 
-        cols_sql = ", ".join(["feature_id"] + [f'"{c}"' for c in cols_to_insert])
-        placeholders_sql = ", ".join(placeholders)
+    # DataFrame als temporaere View registrieren
+    conn.register("raw_import", df)
 
-        conn.execute(
-            f"INSERT INTO features ({cols_sql}) VALUES ({placeholders_sql})",
-            values
-        )
+    # Ein einziger INSERT ... SELECT mit DuckDB-seitiger Transformation
+    insert_sql = ", ".join(insert_cols)
+    select_sql = ", ".join(select_exprs)
 
-        if (idx + 1) % 1000 == 0:
-            print(f"      {idx + 1:,} Features importiert...", end="\r")
+    conn.execute(f"""
+        INSERT INTO features ({insert_sql})
+        SELECT {select_sql}
+        FROM raw_import
+    """)
 
-    print(f"      {len(gdf):,} Features mit {total_cells:,} H3 Cells importiert.    ")
+    conn.unregister("raw_import")
+
+    elapsed = time.time() - start
+    total_cells = conn.execute("SELECT COALESCE(SUM(h3_cell_count), 0) FROM features").fetchone()[0]
+    print(f"   {len(gdf):,} Features mit {total_cells:,} H3 Cells importiert in {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +231,9 @@ def main():
 
     # Import
     print(f"\n3. Import Features + H3 Cells...")
-    start = time.time()
+    start_total = time.time()
     import_features(conn, gdf)
-    print(f"   Fertig in {time.time() - start:.1f}s")
+    print(f"   Gesamt: {time.time() - start_total:.1f}s")
 
     # Stats
     print(f"\n4. Statistiken:")
