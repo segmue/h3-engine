@@ -22,9 +22,6 @@ from .predicates import (
     touches,
 )
 
-from spatial_engine import SpatialPredicateEngine
-from geometric_engine import GeometricPredicateEngine
-from .h3_engine import H3PredicateEngine
 
 __all__ = [
     "point_to_h3",
@@ -40,8 +37,5 @@ __all__ = [
     "intersects",
     "within",
     "contains",
-    "touches",
-    "SpatialPredicateEngine",
-    "H3PredicateEngine",
-    "GeometricPredicateEngine",
+    "touches"
 ]

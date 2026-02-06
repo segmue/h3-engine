@@ -14,7 +14,9 @@ from typing import Set, List, Union
 import h3
 
 
-def _normalize_to_coarser_resolution(cells_a: Set[str], cells_b: Set[str]) -> tuple[Set[str], Set[str], int]:
+def _normalize_to_coarser_resolution(
+    cells_a: Set[str], cells_b: Set[str]
+) -> tuple[Set[str], Set[str], int]:
     """
     Normalize two cell sets to their coarser resolution using H3 hierarchy.
 
@@ -50,7 +52,9 @@ def _normalize_to_coarser_resolution(cells_a: Set[str], cells_b: Set[str]) -> tu
     return cells_a, cells_b, target_res
 
 
-def intersects(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]) -> bool:
+def intersects(
+    cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]
+) -> bool:
     """
     Test if two H3 cell sets intersect (hierarchical-aware).
 
@@ -85,7 +89,9 @@ def intersects(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], Lis
     return len(norm_a & norm_b) > 0
 
 
-def within(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]) -> bool:
+def within(
+    cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]
+) -> bool:
     """
     Test if all cells in A are contained within B (hierarchical-aware).
 
@@ -118,7 +124,9 @@ def within(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[st
     return norm_a.issubset(norm_b)
 
 
-def contains(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]) -> bool:
+def contains(
+    cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]
+) -> bool:
     """
     Test if A contains all cells in B (hierarchical-aware).
 
@@ -151,84 +159,3 @@ def contains(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[
     norm_a, norm_b, _ = _normalize_to_coarser_resolution(set_a, set_b)
 
     return norm_b.issubset(norm_a)
-
-
-def touches(cells_a: Union[Set[str], List[str]], cells_b: Union[Set[str], List[str]]) -> bool:
-    """
-    Test if two H3 cell sets touch (hierarchical-aware).
-
-    Two cell sets touch if they have no cells in common (don't intersect)
-    but at least one cell in A is a neighbor of at least one cell in B.
-
-    Args:
-        cells_a: Set or list of H3 cell IDs (can be any resolution)
-        cells_b: Set or list of H3 cell IDs (can be any resolution)
-
-    Returns:
-        True if the sets touch but don't intersect, False otherwise
-
-    Example:
-        >>> cells_a = {'8a1234567890abc'}
-        >>> cells_b = {'8a1234567890abd'}  # Adjacent cell
-        >>> touches(cells_a, cells_b)
-        True  # (if they are neighbors)
-    """
-    set_a = set(cells_a) if not isinstance(cells_a, set) else cells_a
-    set_b = set(cells_b) if not isinstance(cells_b, set) else cells_b
-
-    # First check: they must not intersect (uses hierarchical intersects)
-    if intersects(set_a, set_b):
-        return False
-
-    # Normalize to same resolution for neighbor checks
-    norm_a, norm_b, _ = _normalize_to_coarser_resolution(set_a, set_b)
-
-    # Get all neighbors of cells in A (at normalized resolution)
-    neighbors_a = set()
-    for cell in norm_a:
-        try:
-            # Get direct neighbors (k=1)
-            neighbors = set(h3.grid_disk(cell, k=1))
-            neighbors_a.update(neighbors)
-        except Exception:
-            # Skip invalid cells
-            continue
-
-    # Remove cells from A itself (we only want the neighboring cells)
-    neighbors_a -= norm_a
-
-    # Check if any neighbor of A is in B
-    return len(neighbors_a & norm_b) > 0
-
-
-def get_neighbors(cells: Union[Set[str], List[str]], k: int = 1) -> Set[str]:
-    """
-    Get all neighboring cells for a set of H3 cells.
-
-    Args:
-        cells: Set or list of H3 cell IDs
-        k: Distance (ring number) for neighbors, default 1 for direct neighbors
-
-    Returns:
-        Set of neighboring H3 cell IDs (excluding input cells)
-
-    Example:
-        >>> cells = {'8a1234567890abc'}
-        >>> neighbors = get_neighbors(cells)
-        >>> len(neighbors)  # Typically 6 for a single hexagon
-    """
-    cell_set = set(cells) if not isinstance(cells, set) else cells
-    all_neighbors = set()
-
-    for cell in cell_set:
-        try:
-            neighbors = h3.grid_disk(cell, k=k)
-            all_neighbors.update(neighbors)
-        except Exception:
-            # Skip invalid cells
-            continue
-
-    # Remove original cells
-    all_neighbors -= cell_set
-
-    return all_neighbors

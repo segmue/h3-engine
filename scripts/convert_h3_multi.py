@@ -33,7 +33,7 @@ import pandas as pd
 
 # Projektverzeichnis zum Importpfad hinzufuegen
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from dggs_h3.converter import convert_geodataframe_to_h3_adaptive, ContainmentMode
+from converter.converter import convert_geodataframe_to_h3_adaptive, ContainmentMode
 
 
 # ---------------------------------------------------------------------------
@@ -44,12 +44,15 @@ from dggs_h3.converter import convert_geodataframe_to_h3_adaptive, ContainmentMo
 CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 
 # Gueltige Containment-Modi aus der ContainmentMode-Enum
-VALID_CONTAINMENT_MODES: dict[str, ContainmentMode] = {m.value: m for m in ContainmentMode}
+VALID_CONTAINMENT_MODES: dict[str, ContainmentMode] = {
+    m.value: m for m in ContainmentMode
+}
 
 
 # ---------------------------------------------------------------------------
 # Config laden
 # ---------------------------------------------------------------------------
+
 
 def load_config(path: Path) -> dict | None:
     """Liest config.yaml. Gibt None zurueck wenn die Datei nicht existiert."""
@@ -62,6 +65,7 @@ def load_config(path: Path) -> dict | None:
 # ---------------------------------------------------------------------------
 # Interaktive Eingabe
 # ---------------------------------------------------------------------------
+
 
 def _prompt_line(label: str) -> str:
     """Liest eine nicht-leere Zeile vom User."""
@@ -87,7 +91,9 @@ def prompt_input_files() -> list[str]:
     return files
 
 
-def prompt_int(label: str, min_val: int | None = None, max_val: int | None = None) -> int:
+def prompt_int(
+    label: str, min_val: int | None = None, max_val: int | None = None
+) -> int:
     """Fragt nach einem Integer mit optionalen Grenzen."""
     while True:
         raw = input(f"  {label}: ").strip()
@@ -143,6 +149,7 @@ def collect_params_interactive() -> dict:
 # Anzeige + Validierung
 # ---------------------------------------------------------------------------
 
+
 def display_config(config: dict) -> None:
     """Gibt die Konfiguration formatiert aus."""
     print("\n" + "=" * 60)
@@ -196,14 +203,15 @@ def validate_config(config: dict) -> None:
 # Hauptlogik
 # ---------------------------------------------------------------------------
 
+
 def run_conversion(config: dict) -> None:
     """Laden -- Zusammenfuegen -- Konvertieren -- Speichern."""
 
-    input_paths  = [Path(f) for f in config["input_files"]]
-    output_path  = Path(config["output_file"])
+    input_paths = [Path(f) for f in config["input_files"]]
+    output_path = Path(config["output_file"])
     target_cells = config["target_cells"]
-    min_res      = config["min_resolution"]
-    max_res      = config["max_resolution"]
+    min_res = config["min_resolution"]
+    max_res = config["max_resolution"]
     containment_mode = VALID_CONTAINMENT_MODES[config["containment_mode"]]
 
     # ------------------------------------------------------------------
@@ -224,9 +232,13 @@ def run_conversion(config: dict) -> None:
     crs_set = {str(g.crs) for g in gdfs}
     if len(crs_set) > 1:
         print(f"\n   Warnung: unterschiedliche CRS erkannt: {crs_set}")
-        print("   Alle Datensätze werden auf das CRS des ersten Datensatzes reprojiziert.")
+        print(
+            "   Alle Datensätze werden auf das CRS des ersten Datensatzes reprojiziert."
+        )
         target_crs = gdfs[0].crs
-        gdfs = [g.to_crs(target_crs) if str(g.crs) != str(target_crs) else g for g in gdfs]
+        gdfs = [
+            g.to_crs(target_crs) if str(g.crs) != str(target_crs) else g for g in gdfs
+        ]
 
     combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs=gdfs[0].crs)
     print(f"\n   Zusammengefuegt: {len(combined)} Zeilen")
@@ -236,7 +248,9 @@ def run_conversion(config: dict) -> None:
     # 2. H3-Konvertierung
     # ------------------------------------------------------------------
     print(f"\n2. H3-Konvertierung (adaptiv)...")
-    print(f"   Polygone/MultiPolygone : adaptiv | Ziel {target_cells} Cells | Res {min_res}-{max_res}")
+    print(
+        f"   Polygone/MultiPolygone : adaptiv | Ziel {target_cells} Cells | Res {min_res}-{max_res}"
+    )
     print(f"   Punkte/Linien/Multi*   : feste Resolution {max_res}")
     print(f"   Containment-Modus      : {containment_mode.value}")
 
@@ -250,11 +264,13 @@ def run_conversion(config: dict) -> None:
     )
     elapsed = time.time() - start
 
-    combined["h3_cells"]      = h3_cells
+    combined["h3_cells"] = h3_cells
     combined["h3_resolution"] = resolutions
     combined["h3_cell_count"] = [len(s) for s in h3_cells]
 
-    print(f"\n   Konvertierung: {elapsed:.2f} s  ({elapsed / len(combined) * 1000:.1f} ms/Zeile)")
+    print(
+        f"\n   Konvertierung: {elapsed:.2f} s  ({elapsed / len(combined) * 1000:.1f} ms/Zeile)"
+    )
 
     # ------------------------------------------------------------------
     # 3. Statistiken
@@ -262,7 +278,9 @@ def run_conversion(config: dict) -> None:
     print(f"\n3. Statistiken:")
     print(f"   Gesamt H3-Cells:          {combined['h3_cell_count'].sum():,}")
     print(f"   Durchschnitt Cells/Zeile: {combined['h3_cell_count'].mean():.0f}")
-    print(f"   Min / Max Cells:          {combined['h3_cell_count'].min()} / {combined['h3_cell_count'].max()}")
+    print(
+        f"   Min / Max Cells:          {combined['h3_cell_count'].min()} / {combined['h3_cell_count'].max()}"
+    )
 
     print(f"\n   Resolution-Verteilung:")
     for res in sorted(combined["h3_resolution"].unique()):
@@ -272,7 +290,7 @@ def run_conversion(config: dict) -> None:
     print(f"\n   Pro Quelldatei:")
     for src in combined["_source_file"].unique():
         mask = combined["_source_file"] == src
-        sub  = combined.loc[mask]
+        sub = combined.loc[mask]
         print(
             f"     {src:40s} {mask.sum():5d} Zeilen | "
             f"{sub['h3_cell_count'].sum():>8,} Cells | "
@@ -306,6 +324,7 @@ def run_conversion(config: dict) -> None:
 # ---------------------------------------------------------------------------
 # Entry-Point
 # ---------------------------------------------------------------------------
+
 
 def main():
     print("\n" + "=" * 60)
