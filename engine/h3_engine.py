@@ -1,21 +1,31 @@
 """
 H3Engine - DuckDB-basierte Spatial Predicates fuer H3 Cells.
 
-Alle Predicates unterstuetzen verschiedene Resolution-Levels durch
-vorberechnete Parent-Spalten in der h3_index Tabelle.
+Alle Predicates nutzen DuckDB's H3 Extension fuer Resolution-Normalisierung
+via h3_cell_to_parent(). H3 Cells werden als UBIGINT[] Arrays in der
+features Tabelle gespeichert und bei Bedarf via UNNEST expandiert.
+
+Fuer allgemeine Queries wird DuckDB's Relational API direkt exponiert via
+db.features (DuckDBPyRelation). Spatial Predicates akzeptieren sowohl
+SQL WHERE-Strings als auch DuckDBPyRelation Objekte.
 
 Verwendung:
     from engine import H3Engine
 
     db = H3Engine("data.duckdb")
 
-    # Boolean Predicates
-    db.intersects("kategorie = 'Wald'", "kategorie = 'See'")
-    db.within("feature_id = 123", "kategorie = 'Kanton'")
-    db.contains("kategorie = 'Kanton'", "feature_id = 123")
+    # DuckDB Relational API fuer allgemeine Queries
+    wald = db.features.filter("OBJEKTART = 'Wald'")
+    wald.aggregate("count(*)").df()
+    wald.project("NAME, h3_resolution").order("NAME").limit(10).df()
+
+    # Spatial Predicates (str oder DuckDBPyRelation)
+    seen = db.features.filter("OBJEKTART = 'See'")
+    db.intersects(wald, seen)
+    db.intersects("OBJEKTART = 'Wald'", "OBJEKTART = 'See'")  # old-style
 
     # Intersection mit Cells
-    cells, resolution = db.intersection("kategorie = 'Wald'", "name = 'Zuerichsee'")
+    cells, resolution = db.intersection(wald, seen)
 """
 
 from pathlib import Path
@@ -24,13 +34,20 @@ from typing import Union
 import duckdb
 import h3
 
+# Typ-Alias fuer Predicate-Argumente: SQL-String oder DuckDB Relation
+FeatureSet = Union[str, duckdb.DuckDBPyRelation]
+
 
 class H3Engine:
-    """DuckDB-basierte H3 Spatial Query Engine."""
+    """DuckDB-basierte H3 Spatial Query Engine.
 
-    # Parent-Spalten Range (muss mit import_to_duckdb.py uebereinstimmen)
-    MIN_PARENT_RES = 5
-    MAX_PARENT_RES = 14
+    Kombiniert DuckDB's Relational API (fuer allgemeine Queries) mit
+    spezialisierten H3 Spatial Predicates (intersects, within, contains,
+    intersection).
+
+    Attributes:
+        conn: DuckDB Connection (direkt nutzbar fuer Raw SQL)
+    """
 
     def __init__(self, db_path: Union[str, Path]):
         """
@@ -57,157 +74,185 @@ class H3Engine:
         self.close()
 
     # -------------------------------------------------------------------------
+    # DuckDB Relational API
+    # -------------------------------------------------------------------------
+
+    @property
+    def features(self) -> duckdb.DuckDBPyRelation:
+        """DuckDB Relation auf die features Tabelle.
+
+        Gibt ein DuckDBPyRelation zurueck -- DuckDB's volle Relational API
+        ist direkt verfuegbar:
+
+            db.features.filter("OBJEKTART = 'Wald'").aggregate("count(*)").df()
+            db.features.project("NAME, h3_resolution").order("NAME").limit(10).df()
+
+        Kann auch als Input fuer Spatial Predicates genutzt werden:
+
+            wald = db.features.filter("OBJEKTART = 'Wald'")
+            db.intersects(wald, seen)
+        """
+        return self.conn.table("features")
+
+    # -------------------------------------------------------------------------
     # Hilfsmethoden
     # -------------------------------------------------------------------------
 
-    def _get_resolution_range(self, where: str) -> tuple[int, int]:
-        """Ermittelt min/max Resolution fuer eine WHERE-Bedingung."""
-        result = self.conn.execute(f"""
-            SELECT MIN(i.resolution), MAX(i.resolution)
-            FROM h3_index i
-            JOIN features f ON i.feature_id = f.feature_id
-            WHERE {where}
-        """).fetchone()
-        return result[0], result[1]
+    def _to_table_expr(self, condition: FeatureSet) -> str:
+        """Konvertiert str oder DuckDBPyRelation zu einem SQL-Tabellenausdruck.
 
-    def _get_join_column(self, res_a: int, res_b: int) -> tuple[str, str, int]:
-        """
-        Bestimmt die Join-Spalten basierend auf den Resolutions.
+        Args:
+            condition: SQL WHERE-String oder DuckDBPyRelation
 
         Returns:
-            (column_a, column_b, target_resolution)
+            SQL-Fragment das als FROM-Quelle nutzbar ist
         """
-        target_res = min(res_a, res_b)
+        if isinstance(condition, str):
+            return f"(SELECT * FROM features WHERE {condition})"
 
-        # Spalte fuer A
-        if res_a == target_res:
-            col_a = "a.h3_cell"
-        else:
-            col_a = f"a.parent_{target_res}"
+        # DuckDBPyRelation: als temporaere View registrieren
+        view_name = f"_h3_tmp_{id(condition)}"
+        self.conn.register(view_name, condition)
+        return view_name
 
-        # Spalte fuer B
-        if res_b == target_res:
-            col_b = "b.h3_cell"
-        else:
-            col_b = f"b.parent_{target_res}"
+    def _cleanup_views(self, *conditions: FeatureSet) -> None:
+        """Raeumt temporaere Views auf die fuer Relations erstellt wurden."""
+        for cond in conditions:
+            if isinstance(cond, duckdb.DuckDBPyRelation):
+                view_name = f"_h3_tmp_{id(cond)}"
+                try:
+                    self.conn.unregister(view_name)
+                except Exception:
+                    pass
 
-        return col_a, col_b, target_res
+    def _get_resolution_range(self, table_expr: str) -> tuple[int, int]:
+        """Ermittelt min/max Resolution fuer einen Tabellenausdruck."""
+        result = self.conn.execute(f"""
+            SELECT MIN(h3_resolution), MAX(h3_resolution)
+            FROM {table_expr}
+        """).fetchone()
+        return result[0], result[1]
 
     # -------------------------------------------------------------------------
     # Boolean Predicates
     # -------------------------------------------------------------------------
 
-    def intersects(self, where_a: str, where_b: str) -> bool:
+    def intersects(self, a: FeatureSet, b: FeatureSet) -> bool:
         """
         Prueft ob die Features von A und B sich ueberschneiden.
 
         Args:
-            where_a: SQL WHERE-Bedingung fuer Feature-Set A
-            where_b: SQL WHERE-Bedingung fuer Feature-Set B
+            a: Feature-Set A (SQL WHERE-String oder DuckDBPyRelation)
+            b: Feature-Set B (SQL WHERE-String oder DuckDBPyRelation)
 
         Returns:
             True wenn mindestens eine Cell von A mit einer Cell von B matched
 
         Example:
-            db.intersects("kategorie = 'Wald'", "kategorie = 'See'")
+            wald = db.features.filter("OBJEKTART = 'Wald'")
+            seen = db.features.filter("OBJEKTART = 'See'")
+            db.intersects(wald, seen)
+            db.intersects("OBJEKTART = 'Wald'", "OBJEKTART = 'See'")
         """
-        # Resolutions ermitteln
-        min_a, max_a = self._get_resolution_range(where_a)
-        min_b, max_b = self._get_resolution_range(where_b)
+        expr_a = self._to_table_expr(a)
+        expr_b = self._to_table_expr(b)
 
-        if min_a is None or min_b is None:
-            return False  # Keine Daten
+        try:
+            min_a, max_a = self._get_resolution_range(expr_a)
+            min_b, max_b = self._get_resolution_range(expr_b)
 
-        # Zur gröberen Resolution joinen
-        target_res = min(min_a, min_b)
-        col_a, col_b, _ = self._get_join_column(min_a, target_res)
-        col_a2, col_b2, _ = self._get_join_column(max_a, target_res)
+            if min_a is None or min_b is None:
+                return False
 
-        # Bei gemischten Resolutions: konservativ die gröbste nehmen
-        col_a = f"COALESCE(a.parent_{target_res}, a.h3_cell)" if min_a != max_a else col_a
-        col_b = f"COALESCE(b.parent_{target_res}, b.h3_cell)" if min_b != max_b else col_b
+            target_res = min(min_a, min_b)
 
-        # Einfacher Fall: gleiche oder ähnliche Resolution
-        result = self.conn.execute(f"""
-            SELECT 1
-            FROM h3_index a
-            JOIN features fa ON a.feature_id = fa.feature_id
-            JOIN h3_index b ON {col_a} = {col_b}
-            JOIN features fb ON b.feature_id = fb.feature_id
-            WHERE ({where_a.replace('feature_id', 'fa.feature_id').replace('kategorie', 'fa.kategorie')})
-              AND ({where_b.replace('feature_id', 'fb.feature_id').replace('kategorie', 'fb.kategorie')})
-            LIMIT 1
-        """).fetchone()
+            result = self.conn.execute(f"""
+                WITH a_parents AS (
+                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as parent
+                    FROM {expr_a}
+                ),
+                b_parents AS (
+                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as parent
+                    FROM {expr_b}
+                )
+                SELECT 1
+                FROM a_parents
+                JOIN b_parents ON a_parents.parent = b_parents.parent
+                LIMIT 1
+            """).fetchone()
 
-        return result is not None
+            return result is not None
+        finally:
+            self._cleanup_views(a, b)
 
-    def within(self, where_a: str, where_b: str) -> bool:
+    def within(self, a: FeatureSet, b: FeatureSet) -> bool:
         """
         Prueft ob alle Cells von A innerhalb von B liegen.
 
         Args:
-            where_a: SQL WHERE-Bedingung fuer Feature-Set A (das "innere")
-            where_b: SQL WHERE-Bedingung fuer Feature-Set B (das "aeussere")
+            a: Feature-Set A, das "innere" (SQL WHERE-String oder DuckDBPyRelation)
+            b: Feature-Set B, das "aeussere" (SQL WHERE-String oder DuckDBPyRelation)
 
         Returns:
             True wenn alle Cells von A in B enthalten sind
 
         Example:
-            db.within("feature_id = 123", "kategorie = 'Kanton'")
+            db.within("feature_id = 123", db.features.filter("OBJEKTART = 'Kanton'"))
         """
-        # Resolutions ermitteln
-        min_a, max_a = self._get_resolution_range(where_a)
-        min_b, max_b = self._get_resolution_range(where_b)
+        expr_a = self._to_table_expr(a)
+        expr_b = self._to_table_expr(b)
 
-        if min_a is None or min_b is None:
-            return False
+        try:
+            min_a, max_a = self._get_resolution_range(expr_a)
+            min_b, max_b = self._get_resolution_range(expr_b)
 
-        target_res = min(min_a, min_b)
+            if min_a is None or min_b is None:
+                return False
 
-        # Zaehle A-Cells die NICHT in B sind
-        result = self.conn.execute(f"""
-            WITH a_cells AS (
-                SELECT DISTINCT COALESCE(a.parent_{target_res}, a.h3_cell) as cell
-                FROM h3_index a
-                JOIN features fa ON a.feature_id = fa.feature_id
-                WHERE {where_a}
-            ),
-            b_cells AS (
-                SELECT DISTINCT COALESCE(b.parent_{target_res}, b.h3_cell) as cell
-                FROM h3_index b
-                JOIN features fb ON b.feature_id = fb.feature_id
-                WHERE {where_b}
-            )
-            SELECT COUNT(*)
-            FROM a_cells
-            WHERE cell NOT IN (SELECT cell FROM b_cells)
-        """).fetchone()
+            target_res = min(min_a, min_b)
 
-        return result[0] == 0
+            result = self.conn.execute(f"""
+                WITH a_cells AS (
+                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
+                    FROM {expr_a}
+                ),
+                b_cells AS (
+                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
+                    FROM {expr_b}
+                )
+                SELECT COUNT(*)
+                FROM a_cells
+                WHERE cell NOT IN (SELECT cell FROM b_cells)
+            """).fetchone()
 
-    def contains(self, where_a: str, where_b: str) -> bool:
+            return result[0] == 0
+        finally:
+            self._cleanup_views(a, b)
+
+    def contains(self, a: FeatureSet, b: FeatureSet) -> bool:
         """
         Prueft ob A alle Cells von B enthaelt.
 
         Dies ist das Inverse von within(): contains(A, B) == within(B, A)
 
         Args:
-            where_a: SQL WHERE-Bedingung fuer Feature-Set A (das "aeussere")
-            where_b: SQL WHERE-Bedingung fuer Feature-Set B (das "innere")
+            a: Feature-Set A, das "aeussere" (SQL WHERE-String oder DuckDBPyRelation)
+            b: Feature-Set B, das "innere" (SQL WHERE-String oder DuckDBPyRelation)
 
         Returns:
             True wenn alle Cells von B in A enthalten sind
 
         Example:
-            db.contains("kategorie = 'Kanton'", "feature_id = 123")
+            kanton = db.features.filter("OBJEKTART = 'Kanton'")
+            db.contains(kanton, "feature_id = 123")
         """
-        return self.within(where_b, where_a)
+        return self.within(b, a)
 
     # -------------------------------------------------------------------------
     # Intersection (gibt Cells zurueck)
     # -------------------------------------------------------------------------
 
-    def intersection(self, where_a: str, where_b: str) -> tuple[list[str], int]:
+    def intersection(self, a: FeatureSet, b: FeatureSet) -> tuple[list[str], int]:
         """
         Berechnet die Intersection von A und B.
 
@@ -215,63 +260,63 @@ class H3Engine:
         Resolution (fuer maximale Genauigkeit).
 
         Args:
-            where_a: SQL WHERE-Bedingung fuer Feature-Set A
-            where_b: SQL WHERE-Bedingung fuer Feature-Set B
+            a: Feature-Set A (SQL WHERE-String oder DuckDBPyRelation)
+            b: Feature-Set B (SQL WHERE-String oder DuckDBPyRelation)
 
         Returns:
             Tuple von (Liste der H3 Cell IDs als Strings, Resolution)
             Bei leerer Intersection: ([], None)
 
         Example:
-            cells, res = db.intersection("kategorie = 'Wald'", "name = 'Zuerichsee'")
+            wald = db.features.filter("OBJEKTART = 'Wald'")
+            orte = db.features.filter("OBJEKTART = 'Ort'")
+            cells, res = db.intersection(wald, orte)
             print(f"{len(cells)} Cells auf Resolution {res}")
         """
-        # Resolutions ermitteln
-        min_a, max_a = self._get_resolution_range(where_a)
-        min_b, max_b = self._get_resolution_range(where_b)
+        expr_a = self._to_table_expr(a)
+        expr_b = self._to_table_expr(b)
 
-        if min_a is None or min_b is None:
-            return [], None
+        try:
+            min_a, max_a = self._get_resolution_range(expr_a)
+            min_b, max_b = self._get_resolution_range(expr_b)
 
-        # Join auf der gröberen Resolution
-        target_res = min(min_a, min_b)
+            if min_a is None or min_b is None:
+                return [], None
 
-        # Ergebnis auf der feineren Resolution
-        result_res = max(max_a, max_b)
+            # Join auf der groeberen Resolution
+            target_res = min(min_a, min_b)
 
-        # Bestimme welche Seite die feinere ist
-        if max_a >= max_b:
-            # A ist feiner oder gleich -> A-Cells zurueckgeben
-            fine_side = "a"
-            coarse_side = "b"
-            fine_where = where_a
-            coarse_where = where_b
-        else:
-            # B ist feiner -> B-Cells zurueckgeben
-            fine_side = "b"
-            coarse_side = "a"
-            fine_where = where_b
-            coarse_where = where_a
+            # Ergebnis auf der feineren Resolution
+            result_res = max(max_a, max_b)
 
-        # Query: Finde feine Cells deren Parent in der groben Menge ist
-        result = self.conn.execute(f"""
-            WITH coarse_cells AS (
-                SELECT DISTINCT COALESCE(c.parent_{target_res}, c.h3_cell) as cell
-                FROM h3_index c
-                JOIN features fc ON c.feature_id = fc.feature_id
-                WHERE {coarse_where}
-            )
-            SELECT DISTINCT f.h3_cell
-            FROM h3_index f
-            JOIN features ff ON f.feature_id = ff.feature_id
-            WHERE {fine_where}
-              AND COALESCE(f.parent_{target_res}, f.h3_cell) IN (SELECT cell FROM coarse_cells)
-        """).fetchall()
+            # Bestimme welche Seite die feinere ist
+            if max_a >= max_b:
+                fine_expr = expr_a
+                coarse_expr = expr_b
+            else:
+                fine_expr = expr_b
+                coarse_expr = expr_a
 
-        # Cell IDs von uint64 zu String konvertieren
-        cells = [h3.int_to_str(row[0]) for row in result]
+            # Finde feine Cells deren Parent in der groben Menge ist
+            result = self.conn.execute(f"""
+                WITH coarse_cells AS (
+                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
+                    FROM {coarse_expr}
+                )
+                SELECT DISTINCT fine.cell
+                FROM (
+                    SELECT UNNEST(h3_cells) as cell
+                    FROM {fine_expr}
+                ) fine
+                WHERE h3_cell_to_parent(fine.cell, {target_res}) IN (SELECT cell FROM coarse_cells)
+            """).fetchall()
 
-        return cells, result_res if cells else None
+            # Cell IDs von uint64 zu String konvertieren
+            cells = [h3.int_to_str(row[0]) for row in result]
+
+            return cells, result_res if cells else None
+        finally:
+            self._cleanup_views(a, b)
 
     # -------------------------------------------------------------------------
     # Utility
@@ -280,17 +325,16 @@ class H3Engine:
     def count_cells(self, where: str) -> int:
         """Zaehlt die Anzahl H3 Cells fuer eine WHERE-Bedingung."""
         result = self.conn.execute(f"""
-            SELECT COUNT(*)
-            FROM h3_index i
-            JOIN features f ON i.feature_id = f.feature_id
+            SELECT SUM(h3_cell_count)
+            FROM features
             WHERE {where}
         """).fetchone()
-        return result[0]
+        return result[0] or 0
 
     def count_features(self, where: str) -> int:
         """Zaehlt die Anzahl Features fuer eine WHERE-Bedingung."""
         result = self.conn.execute(f"""
-            SELECT COUNT(DISTINCT feature_id)
+            SELECT COUNT(*)
             FROM features
             WHERE {where}
         """).fetchone()
@@ -299,10 +343,9 @@ class H3Engine:
     def get_resolutions(self, where: str) -> list[int]:
         """Gibt alle verwendeten Resolutions fuer eine WHERE-Bedingung zurueck."""
         result = self.conn.execute(f"""
-            SELECT DISTINCT i.resolution
-            FROM h3_index i
-            JOIN features f ON i.feature_id = f.feature_id
+            SELECT DISTINCT h3_resolution
+            FROM features
             WHERE {where}
-            ORDER BY i.resolution
+            ORDER BY h3_resolution
         """).fetchall()
         return [row[0] for row in result]

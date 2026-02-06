@@ -3,12 +3,17 @@ GPKG to DuckDB Importer
 -----------------------
 Liest ein GPKG (Output von convert_h3_multi.py) und importiert es in DuckDB.
 
-Erstellt zwei Tabellen:
-  - features: Alle Spalten aus dem GPKG (Geometrie als WKB)
-  - h3_index: Eine Zeile pro H3-Cell mit vorberechneten Parent-Spalten
+Erstellt eine einzelne Tabelle:
+  - features: Alle Spalten aus dem GPKG (Geometrie als WKB, H3 Cells als UBIGINT[])
 
-Die h3_index Tabelle ermoeglicht schnelle Intersection-Queries ueber
-verschiedene Resolution-Levels hinweg.
+Die H3 Cells werden als Array (UBIGINT[]) gespeichert. Parent-Cells fuer
+verschiedene Resolution-Levels werden zur Query-Zeit berechnet via
+DuckDB H3 Extension (h3_cell_to_parent).
+
+Der Import nutzt DuckDB's Bulk-Operationen: Das GeoDataFrame wird als
+temporaere View registriert und per INSERT INTO ... SELECT in einem
+einzigen Schritt transformiert und eingefuegt. Die H3-String-Konvertierung
+(str_split + h3_string_to_h3) laeuft vektorisiert in DuckDB statt in Python.
 
 Verwendung:
     python scripts/import_to_duckdb.py
@@ -20,7 +25,7 @@ from pathlib import Path
 
 import duckdb
 import geopandas as gpd
-import h3
+import pandas as pd
 import yaml
 
 # Projektverzeichnis zum Importpfad hinzufuegen
@@ -31,10 +36,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-
-# Parent-Spalten von min_resolution bis 14 (max 15 - 1)
-MIN_PARENT_RES = 5
-MAX_PARENT_RES = 14
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +67,14 @@ def setup_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
 
 
 def create_tables(conn: duckdb.DuckDBPyConnection, sample_gdf: gpd.GeoDataFrame) -> None:
-    """Erstellt die features und h3_index Tabellen."""
+    """Erstellt die features Tabelle mit H3 Cells als Array."""
 
-    # Features Tabelle: Dynamisch basierend auf GPKG-Spalten
-    # Alle Spalten ausser geometry und h3_cells (die werden speziell behandelt)
     columns = []
     for col in sample_gdf.columns:
         if col == "geometry":
             columns.append("geometry BLOB")  # WKB
         elif col == "h3_cells":
-            continue  # Wird in h3_index Tabelle aufgeloest
+            columns.append("h3_cells UBIGINT[]")  # Array statt separate Tabelle
         elif col == "h3_resolution":
             columns.append("h3_resolution TINYINT")
         elif col == "h3_cell_count":
@@ -99,126 +98,90 @@ def create_tables(conn: duckdb.DuckDBPyConnection, sample_gdf: gpd.GeoDataFrame)
         );
     """)
 
-    # H3 Index Tabelle
-    parent_cols = ",\n    ".join([
-        f"parent_{r} UBIGINT" for r in range(MIN_PARENT_RES, MAX_PARENT_RES + 1)
-    ])
-
-    conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS h3_index (
-            feature_id INTEGER,
-            h3_cell UBIGINT,
-            resolution TINYINT,
-            {parent_cols},
-            PRIMARY KEY (feature_id, h3_cell)
-        );
-    """)
-
-
-def create_indexes(conn: duckdb.DuckDBPyConnection) -> None:
-    """Erstellt Indexes fuer schnelle Joins."""
-    print("   Erstelle Indexes...")
-
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_h3_cell ON h3_index(h3_cell);")
-
-    for r in range(MIN_PARENT_RES, MAX_PARENT_RES + 1):
-        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_parent_{r} ON h3_index(parent_{r});")
-
-    print(f"   {MAX_PARENT_RES - MIN_PARENT_RES + 2} Indexes erstellt.")
-
 
 # ---------------------------------------------------------------------------
 # Import
 # ---------------------------------------------------------------------------
 
 
+def prepare_dataframe(gdf: gpd.GeoDataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """
+    Bereitet ein GeoDataFrame fuer DuckDB Bulk-Import vor.
+
+    Konvertiert Geometrien zu WKB-Bytes und behaelt h3_cells als Rohstring.
+    Die eigentliche H3-String-Konvertierung passiert spaeter in DuckDB (vektorisiert).
+
+    Returns:
+        (DataFrame, insert_columns, select_expressions)
+    """
+    df = pd.DataFrame({"feature_id": range(len(gdf))})
+
+    insert_cols = ["feature_id"]
+    select_exprs = ["feature_id"]
+
+    for col in gdf.columns:
+        if col == "geometry":
+            # Geometrie → WKB Bytes (einzige Python-Iteration, aber in C via Shapely)
+            df["geometry"] = gdf.geometry.apply(lambda g: g.wkb if g else None)
+            insert_cols.append("geometry")
+            select_exprs.append("geometry")
+
+        elif col == "h3_cells":
+            # Als Rohstring behalten → DuckDB konvertiert vektorisiert
+            df["h3_cells_raw"] = gdf["h3_cells"].fillna("")
+            insert_cols.append("h3_cells")
+            select_exprs.append(
+                "CASE WHEN h3_cells_raw = '' THEN []::UBIGINT[] "
+                "ELSE list_transform("
+                "  list_filter(str_split(h3_cells_raw, ';'), x -> x != ''),"
+                "  x -> h3_string_to_h3(x)"
+                ") END AS h3_cells"
+            )
+
+        else:
+            df[col] = gdf[col]
+            insert_cols.append(f'"{col}"')
+            select_exprs.append(f'"{col}"')
+
+    return df, insert_cols, select_exprs
+
+
 def import_features(conn: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFrame) -> None:
-    """Importiert alle Features in die features Tabelle."""
-    print(f"   Importiere {len(gdf)} Features...")
+    """Bulk-importiert alle Features inkl. H3 Cells als Array.
 
-    # Spalten vorbereiten (ohne h3_cells)
-    cols_to_insert = [c for c in gdf.columns if c != "h3_cells"]
+    Statt Zeile-fuer-Zeile INSERT wird das DataFrame bei DuckDB registriert
+    und per INSERT INTO ... SELECT in einem Schritt transformiert:
+    - str_split() spaltet die Semikolon-getrennten H3-Strings
+    - h3_string_to_h3() konvertiert jeden String zu UBIGINT
+    - Alles vektorisiert in DuckDB, kein Python-Loop noetig
+    """
+    print(f"   Bereite {len(gdf):,} Features vor...")
+    start = time.time()
 
-    for idx, row in gdf.iterrows():
-        values = [idx]  # feature_id
-        placeholders = ["?"]
+    df, insert_cols, select_exprs = prepare_dataframe(gdf)
 
-        for col in cols_to_insert:
-            if col == "geometry":
-                # Geometrie als WKB
-                values.append(row.geometry.wkb)
-            else:
-                values.append(row[col])
-            placeholders.append("?")
+    print(f"   DataFrame vorbereitet in {time.time() - start:.1f}s")
+    print(f"   Starte DuckDB Bulk-Import...")
+    start = time.time()
 
-        cols_sql = ", ".join(["feature_id"] + [f'"{c}"' for c in cols_to_insert])
-        placeholders_sql = ", ".join(placeholders)
+    # DataFrame als temporaere View registrieren
+    conn.register("raw_import", df)
 
-        conn.execute(
-            f"INSERT INTO features ({cols_sql}) VALUES ({placeholders_sql})",
-            values
-        )
+    # Ein einziger INSERT ... SELECT mit DuckDB-seitiger Transformation
+    insert_sql = ", ".join(insert_cols)
+    select_sql = ", ".join(select_exprs)
 
+    conn.execute(f"""
+        INSERT INTO features ({insert_sql})
+        SELECT {select_sql}
+        FROM raw_import
+    """)
 
-def import_h3_index(conn: duckdb.DuckDBPyConnection, gdf: gpd.GeoDataFrame) -> None:
-    """Importiert H3 Cells in die h3_index Tabelle mit Parent-Spalten."""
-    print(f"   Importiere H3 Cells...")
+    conn.unregister("raw_import")
 
-    total_cells = 0
-    batch = []
-    batch_size = 10000
-
-    parent_cols = [f"parent_{r}" for r in range(MIN_PARENT_RES, MAX_PARENT_RES + 1)]
-    cols_sql = f"feature_id, h3_cell, resolution, {', '.join(parent_cols)}"
-    placeholders = ", ".join(["?"] * (3 + len(parent_cols)))
-
-    for idx, row in gdf.iterrows():
-        h3_cells_str = row["h3_cells"]
-        resolution = row["h3_resolution"]
-
-        # h3_cells ist semikolon-getrennt
-        if not h3_cells_str:
-            continue
-
-        cells = h3_cells_str.split(";")
-
-        for cell_str in cells:
-            if not cell_str:
-                continue
-
-            # H3 Cell als uint64
-            cell_int = h3.str_to_int(cell_str)
-
-            # Parent-Spalten berechnen
-            parents = []
-            for r in range(MIN_PARENT_RES, MAX_PARENT_RES + 1):
-                if r < resolution:
-                    # Parent berechnen
-                    parent = h3.cell_to_parent(cell_str, r)
-                    parents.append(h3.str_to_int(parent))
-                else:
-                    # Resolution ist gleich oder groeber -> kein Parent
-                    parents.append(None)
-
-            batch.append((idx, cell_int, resolution, *parents))
-            total_cells += 1
-
-            if len(batch) >= batch_size:
-                conn.executemany(
-                    f"INSERT INTO h3_index ({cols_sql}) VALUES ({placeholders})",
-                    batch
-                )
-                batch = []
-                print(f"      {total_cells:,} Cells importiert...", end="\r")
-
-    # Rest importieren
-    if batch:
-        conn.executemany(
-            f"INSERT INTO h3_index ({cols_sql}) VALUES ({placeholders})",
-            batch
-        )
-
-    print(f"      {total_cells:,} Cells importiert.    ")
+    elapsed = time.time() - start
+    total_cells = conn.execute("SELECT COALESCE(SUM(h3_cell_count), 0) FROM features").fetchone()[0]
+    print(f"   {len(gdf):,} Features mit {total_cells:,} H3 Cells importiert in {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -267,39 +230,28 @@ def main():
     create_tables(conn, gdf)
 
     # Import
-    print(f"\n3. Import Features...")
-    start = time.time()
+    print(f"\n3. Import Features + H3 Cells...")
+    start_total = time.time()
     import_features(conn, gdf)
-    print(f"   Fertig in {time.time() - start:.1f}s")
-
-    print(f"\n4. Import H3 Index...")
-    start = time.time()
-    import_h3_index(conn, gdf)
-    print(f"   Fertig in {time.time() - start:.1f}s")
-
-    # Indexes
-    print(f"\n5. Indexes erstellen...")
-    start = time.time()
-    create_indexes(conn)
-    print(f"   Fertig in {time.time() - start:.1f}s")
+    print(f"   Gesamt: {time.time() - start_total:.1f}s")
 
     # Stats
-    print(f"\n6. Statistiken:")
+    print(f"\n4. Statistiken:")
     result = conn.execute("SELECT COUNT(*) FROM features").fetchone()
     print(f"   Features:  {result[0]:,}")
 
-    result = conn.execute("SELECT COUNT(*) FROM h3_index").fetchone()
+    result = conn.execute("SELECT SUM(h3_cell_count) FROM features").fetchone()
     print(f"   H3 Cells:  {result[0]:,}")
 
     result = conn.execute("""
-        SELECT resolution, COUNT(*) as cnt
-        FROM h3_index
-        GROUP BY resolution
-        ORDER BY resolution
+        SELECT h3_resolution, COUNT(*) as cnt, SUM(h3_cell_count) as cells
+        FROM features
+        GROUP BY h3_resolution
+        ORDER BY h3_resolution
     """).fetchall()
     print(f"   Pro Resolution:")
-    for res, cnt in result:
-        print(f"     Res {res:2d}: {cnt:>12,} Cells")
+    for res, cnt, cells in result:
+        print(f"     Res {res:2d}: {cnt:>8,} Features, {cells:>12,} Cells")
 
     # DB Size
     conn.close()
