@@ -30,7 +30,7 @@ import yaml
 
 # Projektverzeichnis zum Importpfad hinzufuegen
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from converter.converter import convert_geodataframe_to_h3_adaptive, ContainmentMode
+from converter.converter import convert_geodataframe_to_h3, ContainmentMode
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +302,7 @@ def convert_to_h3(gdf: gpd.GeoDataFrame, config: dict) -> gpd.GeoDataFrame:
     print(f"   Containment-Modus      : {containment_mode.value}")
 
     start = time.time()
-    h3_cells, resolutions = convert_geodataframe_to_h3_adaptive(
+    h3_cells, resolutions = convert_geodataframe_to_h3(
         gdf,
         target_cells=target_cells,
         min_resolution=min_res,
