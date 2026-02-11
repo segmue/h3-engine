@@ -305,51 +305,34 @@ def point_to_h3(point: Point, resolution: int = 10, source_crs: Optional[Union[s
 
 
 def line_to_h3(line: LineString, resolution: int = 10, source_crs: Optional[Union[str, int]] = None) -> Set[str]:
-    """
-    Convert a line geometry to set of H3 cell IDs that intersect the line.
-
-    Uses point sampling along the line to find all intersecting cells.
-
-    Args:
-        line: Shapely LineString geometry
-        resolution: H3 resolution (0-15), default 10
-        source_crs: Source CRS (e.g., 2056 for LV95, None for WGS84)
-
-    Returns:
-        Set of H3 cell IDs as strings
-
-    Example:
-        >>> line = LineString([(7.5, 47.5), (7.6, 47.6)])
-        >>> cell_ids = line_to_h3(line)
-        >>> print(f"Line intersects {len(cell_ids)} cells")
-    """
-    # Transform to WGS84 if needed
+    # 1. Transform to WGS84 (wie gehabt)
     line_wgs84 = _ensure_wgs84(line, source_crs)
 
     h3_cells = set()
 
-    # Intelligent sampling based on H3 cell size
-    # Get average edge length for this resolution (in km)
-    avg_edge_km = h3.average_hexagon_edge_length(resolution, unit='km')
+    # 2. Koordinaten extrahieren
+    coords = list(line_wgs84.coords)
 
-    # Line length is in degrees for WGS84, approximate conversion
-    # At ~47° latitude (Switzerland), 1° ≈ 78km longitude, 1° ≈ 111km latitude
-    line_length_km = line_wgs84.length * 95  # Rough average
+    # 3. Durch alle Segmente iterieren
+    for i in range(len(coords) - 1):
+        p1 = coords[i]  # (lng, lat)
+        p2 = coords[i + 1]  # (lng, lat)
 
-    # Sample with 3x oversampling to ensure we catch all cells
-    num_samples = max(10, int(line_length_km / avg_edge_km * 3))
+        # H3 Zellen für Start und Ende des Segments finden
+        # Achtung: H3 erwartet (lat, lng), Shapely liefert (lng, lat)
+        cell_start = h3.latlng_to_cell(p1[1], p1[0], resolution)
+        cell_end = h3.latlng_to_cell(p2[1], p2[0], resolution)
 
-    # Cap at reasonable maximum to avoid extreme cases
-    num_samples = min(num_samples, 10000)
-
-    for i in range(num_samples + 1):
-        # Interpolate point along line
-        distance = i / num_samples
-        point = line_wgs84.interpolate(distance, normalized=True)
-
-        lng, lat = point.x, point.y
-        cell_id = h3.latlng_to_cell(lat, lng, resolution)
-        h3_cells.add(cell_id)
+        # 4. Den Pfad zwischen den Zellen berechnen (H3 Native Funktion)
+        # grid_path_cells (früher h3_line) füllt die Lücke topologisch korrekt
+        try:
+            path = h3.grid_path_cells(cell_start, cell_end)
+            h3_cells.update(path)
+        except Exception:
+            # Fallback, falls Zellen zu weit entfernt oder Fehler auftreten
+            # (passiert selten bei benachbarten Geometrie-Punkten)
+            h3_cells.add(cell_start)
+            h3_cells.add(cell_end)
 
     return h3_cells
 

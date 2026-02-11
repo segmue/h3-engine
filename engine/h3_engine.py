@@ -5,6 +5,9 @@ Alle Predicates nutzen DuckDB's H3 Extension fuer Resolution-Normalisierung
 via h3_cell_to_parent(). H3 Cells werden als UBIGINT[] Arrays in der
 features Tabelle gespeichert und bei Bedarf via UNNEST expandiert.
 
+Geometrien werden als GEOMETRY-Typ gespeichert (via DuckDB Spatial Extension),
+was native Spatial Indexing und ST_* Funktionen ermoeglicht.
+
 Fuer allgemeine Queries wird DuckDB's Relational API direkt exponiert via
 db.features (DuckDBPyRelation). Spatial Predicates akzeptieren sowohl
 SQL WHERE-Strings als auch DuckDBPyRelation Objekte.
@@ -26,6 +29,9 @@ Verwendung:
 
     # Intersection mit Cells
     cells, resolution = db.intersection(wald, seen)
+
+    # Geometry-basierte Queries (via Spatial Extension)
+    # ST_* Funktionen stehen zur Verfuegung
 """
 
 from pathlib import Path
@@ -61,6 +67,7 @@ class H3Engine:
             raise FileNotFoundError(f"Datenbank nicht gefunden: {db_path}")
 
         self.conn = duckdb.connect(str(self.db_path), read_only=True)
+        self.conn.execute("LOAD spatial;")
         self.conn.execute("LOAD h3;")
 
     def close(self):

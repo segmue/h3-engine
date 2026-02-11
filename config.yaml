@@ -44,7 +44,7 @@ min_resolution: 5
 #   - Polygone/MultiPolygone: obere Grenze der adaptiven Aufloesung.
 #     Sehr kleine Polygone fallen auf die Centroid-Methode bei dieser Resolution.
 #   - Punkte / Linien / MultiPoints / MultiLines: wird direkt verwendet.
-max_resolution: 15
+max_resolution: 14
 
 # Containment-Modus fuer die Polygon-zu-H3 Konvertierung.
 # Bestimmt, welche Zellen als "gehoerend zum Polygon" gelten.

@@ -15,13 +15,6 @@ from .converter import (
     H3_AVG_HEXAGON_AREA_M2,
 )
 
-from .predicates import (
-    intersects,
-    within,
-    contains,
-    touches,
-)
-
 
 __all__ = [
     "point_to_h3",
@@ -34,8 +27,4 @@ __all__ = [
     "calculate_optimal_resolution",
     "ContainmentMode",
     "H3_AVG_HEXAGON_AREA_M2",
-    "intersects",
-    "within",
-    "contains",
-    "touches"
 ]
