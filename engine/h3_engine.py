@@ -27,18 +27,19 @@ Verwendung:
     db.intersects(wald, seen)
     db.intersects("OBJEKTART = 'Wald'", "OBJEKTART = 'See'")  # old-style
 
-    # Intersection mit Cells
-    cells, resolution = db.intersection(wald, seen)
+    # Set-Operationen (geben DuckDBPyRelation mit 'cell' Spalte zurueck)
+    cells = db.intersection(wald, seen)
+    cells = db.union(wald)
 
-    # Geometry-basierte Queries (via Spatial Extension)
-    # ST_* Funktionen stehen zur Verfuegung
+    # Composable mit area():
+    db.area(db.intersection(wald, seen))
+    db.area(db.union(wald))
 """
 
 from pathlib import Path
 from typing import Union
 
 import duckdb
-import h3
 
 # Typ-Alias fuer Predicate-Argumente: SQL-String oder DuckDB Relation
 FeatureSet = Union[str, duckdb.DuckDBPyRelation]
@@ -256,74 +257,195 @@ class H3Engine:
         return self.within(b, a)
 
     # -------------------------------------------------------------------------
-    # Intersection (gibt Cells zurueck)
+    # Set-Operationen (geben DuckDBPyRelation mit 'cell' Spalte zurueck)
     # -------------------------------------------------------------------------
 
-    def intersection(self, a: FeatureSet, b: FeatureSet) -> tuple[list[str], int]:
+    def intersection(self, a: FeatureSet, b: FeatureSet) -> duckdb.DuckDBPyRelation:
         """
         Berechnet die Intersection von A und B.
 
-        Gibt die Cells zurueck die sich ueberschneiden, auf der FEINEREN
-        Resolution (fuer maximale Genauigkeit).
+        Gibt eine DuckDBPyRelation mit 'cell' Spalte (UBIGINT) zurueck,
+        normalisiert auf die feinste vorkommende Resolution.
+        Composable mit area(): engine.area(engine.intersection(a, b))
 
         Args:
             a: Feature-Set A (SQL WHERE-String oder DuckDBPyRelation)
             b: Feature-Set B (SQL WHERE-String oder DuckDBPyRelation)
 
         Returns:
-            Tuple von (Liste der H3 Cell IDs als Strings, Resolution)
-            Bei leerer Intersection: ([], None)
+            DuckDBPyRelation mit 'cell' Spalte (UBIGINT)
 
         Example:
-            wald = db.features.filter("OBJEKTART = 'Wald'")
-            orte = db.features.filter("OBJEKTART = 'Ort'")
-            cells, res = db.intersection(wald, orte)
-            print(f"{len(cells)} Cells auf Resolution {res}")
+            db.area(db.intersection("OBJEKTART = 'Wald'", "OBJEKTART = 'See'"))
         """
         expr_a = self._to_table_expr(a)
         expr_b = self._to_table_expr(b)
 
-        try:
-            min_a, max_a = self._get_resolution_range(expr_a)
-            min_b, max_b = self._get_resolution_range(expr_b)
+        min_a, max_a = self._get_resolution_range(expr_a)
+        min_b, max_b = self._get_resolution_range(expr_b)
 
-            if min_a is None or min_b is None:
-                return [], None
+        if min_a is None or min_b is None:
+            return self.conn.sql("SELECT NULL::UBIGINT as cell WHERE false")
 
-            # Join auf der groeberen Resolution
-            target_res = min(min_a, min_b)
+        # Join auf der groeberen Resolution
+        target_res = min(min_a, min_b)
 
-            # Ergebnis auf der feineren Resolution
-            result_res = max(max_a, max_b)
+        # Feinste Resolution im Gesamtresultat (fuer Normalisierung)
+        finest_res = max(max_a, max_b)
 
-            # Bestimme welche Seite die feinere ist
-            if max_a >= max_b:
-                fine_expr = expr_a
-                coarse_expr = expr_b
-            else:
-                fine_expr = expr_b
-                coarse_expr = expr_a
+        # Bestimme welche Seite die feinere ist
+        if max_a >= max_b:
+            fine_expr = expr_a
+            coarse_expr = expr_b
+        else:
+            fine_expr = expr_b
+            coarse_expr = expr_a
 
-            # Finde feine Cells deren Parent in der groben Menge ist
-            result = self.conn.execute(f"""
-                WITH coarse_cells AS (
-                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
-                    FROM {coarse_expr}
-                )
-                SELECT DISTINCT fine.cell
+        return self.conn.sql(f"""
+            WITH coarse_cells AS (
+                SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
+                FROM {coarse_expr}
+            ),
+            intersection_raw AS (
+                SELECT fine.cell, fine.res
                 FROM (
-                    SELECT UNNEST(h3_cells) as cell
+                    SELECT UNNEST(h3_cells) as cell, h3_resolution as res
                     FROM {fine_expr}
                 ) fine
-                WHERE h3_cell_to_parent(fine.cell, {target_res}) IN (SELECT cell FROM coarse_cells)
-            """).fetchall()
+                WHERE h3_cell_to_parent(fine.cell, {target_res})
+                      IN (SELECT cell FROM coarse_cells)
+            )
+            SELECT DISTINCT cell FROM (
+                SELECT cell
+                FROM intersection_raw
+                WHERE res = {finest_res}
 
-            # Cell IDs von uint64 zu String konvertieren
-            cells = [h3.int_to_str(row[0]) for row in result]
+                UNION ALL
 
-            return cells, result_res if cells else None
+                SELECT UNNEST(h3_cell_to_children(cell, {finest_res}))
+                FROM intersection_raw
+                WHERE res < {finest_res}
+            )
+        """)
+
+    # -------------------------------------------------------------------------
+    # Area / Messung
+    # -------------------------------------------------------------------------
+
+    def union(self, feature_set: FeatureSet) -> duckdb.DuckDBPyRelation:
+        """Normalisiert alle Cells eines Feature-Sets auf die feinste Resolution.
+
+        Expandiert groebere Cells via h3_cell_to_children() und
+        dedupliziert, um eine korrekte Union ohne Doppelzaehlung zu erhalten.
+        Composable mit area(): engine.area(engine.union(feature_set))
+
+        Args:
+            feature_set: SQL WHERE-String oder DuckDBPyRelation
+
+        Returns:
+            DuckDBPyRelation mit 'cell' Spalte (UBIGINT)
+        """
+        expr = self._to_table_expr(feature_set)
+        min_res, max_res = self._get_resolution_range(expr)
+
+        if max_res is None:
+            return self.conn.sql("SELECT NULL::UBIGINT as cell WHERE false")
+
+        # Alle Resolutions gleich: keine Normalisierung noetig
+        if min_res == max_res:
+            return self.conn.sql(f"""
+                SELECT DISTINCT UNNEST(h3_cells) as cell
+                FROM {expr}
+            """)
+
+        # Normalisierung: Coarse Cells zu Children auf feinster Resolution expandieren
+        return self.conn.sql(f"""
+            SELECT DISTINCT cell FROM (
+                SELECT UNNEST(h3_cells) as cell
+                FROM {expr}
+                WHERE h3_resolution = {max_res}
+
+                UNION ALL
+
+                SELECT UNNEST(h3_cell_to_children(cell, {max_res}))
+                FROM (
+                    SELECT UNNEST(h3_cells) as cell
+                    FROM {expr}
+                    WHERE h3_resolution < {max_res}
+                ) coarse
+            )
+        """)
+
+    def area(self, cell_set: FeatureSet, unit: str = "km^2") -> float:
+        """Berechnet die Flaeche einer Menge von H3 Cells.
+
+        Akzeptiert:
+          - DuckDBPyRelation mit 'cell' Spalte (von union()/intersection())
+          - FeatureSet (SQL-String oder Relation mit h3_cells) fuer einzelne Features
+
+        Args:
+            cell_set: Cell-Relation oder FeatureSet
+            unit: Flaecheneinheit ('km^2' oder 'm^2')
+
+        Returns:
+            Flaeche in der angegebenen Einheit
+
+        Example:
+            db.area(db.union("OBJEKTART = 'Wald'"))
+            db.area(db.intersection(wald, seen))
+            db.area("feature_id = 123")  # einzelnes Feature
+        """
+        # Cell-Relation von union()/intersection(): hat 'cell' Spalte
+        if (isinstance(cell_set, duckdb.DuckDBPyRelation)
+                and 'cell' in cell_set.columns):
+            view = self._to_table_expr(cell_set)
+            try:
+                result = self.conn.execute(f"""
+                    SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
+                    FROM {view}
+                """).fetchone()
+                return result[0]
+            finally:
+                self._cleanup_views(cell_set)
+
+        # FeatureSet: Cells unnesten (fuer einzelne Features / eine Resolution)
+        expr = self._to_table_expr(cell_set)
+        try:
+            result = self.conn.execute(f"""
+                WITH distinct_cells AS (
+                    SELECT DISTINCT UNNEST(h3_cells) as cell
+                    FROM {expr}
+                )
+                SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
+                FROM distinct_cells
+            """).fetchone()
+            return result[0]
         finally:
-            self._cleanup_views(a, b)
+            self._cleanup_views(cell_set)
+
+    def total_area(self, resolution: int = 8, unit: str = "km^2") -> float:
+        """Berechnet die Gesamtflaeche des Datensatzes (vereinfacht).
+
+        Normalisiert alle Cells auf die angegebene Resolution via
+        h3_cell_to_parent(), nimmt DISTINCT, und summiert die Flaechen.
+
+        Args:
+            resolution: Ziel-Resolution fuer Normalisierung (default 8)
+            unit: Flaecheneinheit ('km^2' oder 'm^2')
+
+        Returns:
+            Gesamtflaeche in der angegebenen Einheit
+        """
+        result = self.conn.execute(f"""
+            WITH normalized AS (
+                SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {resolution}) as cell
+                FROM features
+                WHERE h3_resolution >= {resolution}
+            )
+            SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
+            FROM normalized
+        """).fetchone()
+        return result[0]
 
     # -------------------------------------------------------------------------
     # Utility
