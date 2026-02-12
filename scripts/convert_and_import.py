@@ -26,6 +26,7 @@ from pathlib import Path
 import duckdb
 import geopandas as gpd
 import pandas as pd
+import shapely
 import yaml
 
 # Projektverzeichnis zum Importpfad hinzufuegen
@@ -265,6 +266,10 @@ def load_and_merge_geodata(config: dict) -> gpd.GeoDataFrame:
     for path in input_paths:
         print(f"   Lese: {path}")
         gdf = gpd.read_file(path)
+
+        # Z-Werte entfernen
+        gdf.geometry = gdf.geometry.apply(lambda x: shapely.force_2d(x))
+
         gdf["_source_file"] = path.name
         geom_summary = dict(gdf.geometry.geom_type.value_counts())
         print(f"     -> {len(gdf)} Zeilen | CRS: {gdf.crs} | Typen: {geom_summary}")
@@ -502,12 +507,6 @@ def run_unified_conversion(config: dict) -> None:
     print("  Fertig!")
     print("=" * 60)
     print(f"\n  Output: {output_path}")
-    print(f"  Features:")
-    print(f"    - Geometrien als GEOMETRY-Typ (Spatial Extension)")
-    print(f"    - H3 Cells als UBIGINT[] Arrays")
-    print(f"    - Spatial Indexing verfuegbar")
-    print(f"    - ST_* Funktionen verfuegbar")
-
 
 def main():
     print("\n" + "=" * 60)
