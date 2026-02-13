@@ -437,13 +437,34 @@ class H3Engine:
             Gesamtflaeche in der angegebenen Einheit
         """
         result = self.conn.execute(f"""
-            WITH normalized AS (
-                SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {resolution}) as cell
-                FROM features
-                WHERE h3_resolution >= {resolution}
-            )
-            SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
-            FROM normalized
+            LOAD h3;
+
+WITH processed_arrays AS (
+    SELECT 
+        CASE 
+            -- Fall A: Zu fein (z.B. Res 11) -> Jedes Element im Array zu Parent Res 10
+            WHEN h3_resolution > {resolution} THEN 
+                list_transform(h3_cells, x -> h3_cell_to_parent(x, {resolution}))
+            
+            -- Fall B: Zu grob (z.B. Res 8) -> Jedes Element zu Kindern Res 10 (ergibt Liste von Listen)
+            -- flatten() macht daraus wieder ein einfaches Array
+            WHEN h3_resolution < {resolution} THEN 
+                flatten(list_transform(h3_cells, x -> h3_cell_to_children(x, {resolution})))
+            
+            -- Fall C: Bereits Res 10
+            ELSE h3_cells 
+        END AS normalized_array
+    FROM features
+),
+unique_cells AS (
+    -- Jetzt erst unnesten wir die bereits transformierten Arrays
+    -- DISTINCT verhindert Doppelzählungen überlappender Features
+    SELECT DISTINCT UNNEST(normalized_array) AS cell
+    FROM processed_arrays
+)
+SELECT 
+    COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0) AS total_area_km2
+FROM unique_cells;
         """).fetchone()
         return result[0]
 
