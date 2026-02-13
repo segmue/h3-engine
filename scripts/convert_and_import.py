@@ -270,6 +270,11 @@ def load_and_merge_geodata(config: dict) -> gpd.GeoDataFrame:
         # Z-Werte entfernen
         gdf.geometry = gdf.geometry.apply(lambda x: shapely.force_2d(x))
 
+        # Transform to WGS84
+        if gdf.crs and gdf.crs.to_string() != "EPSG:4326":
+            print(f"     -> reproject from {gdf.crs} to EPSG:4326")
+            gdf = gdf.to_crs("EPSG:4326")
+
         gdf["_source_file"] = path.name
         geom_summary = dict(gdf.geometry.geom_type.value_counts())
         print(f"     -> {len(gdf)} Zeilen | CRS: {gdf.crs} | Typen: {geom_summary}")
