@@ -68,8 +68,8 @@ class H3Engine:
             raise FileNotFoundError(f"Datenbank nicht gefunden: {db_path}")
 
         self.conn = duckdb.connect(str(self.db_path), read_only=True)
-        self.conn.execute("LOAD spatial;")
-        self.conn.execute("LOAD h3;")
+        self.conn.execute("INSTALL spatial; LOAD spatial;")
+        self.conn.execute("INSTALL h3 FROM community; LOAD h3;")
 
     def close(self):
         """Schliesst die Datenbankverbindung."""
