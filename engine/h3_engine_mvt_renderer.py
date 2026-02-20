@@ -2,7 +2,7 @@ from typing import Optional
 
 import duckdb
 
-from h3_engine import H3Engine
+from .h3_engine import H3Engine
 
 # Zoom level to H3 resolution mapping for MVT rendering
 ZOOM_TO_H3_RESOLUTION = {
