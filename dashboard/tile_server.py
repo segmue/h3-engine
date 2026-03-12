@@ -115,7 +115,10 @@ def precompute_cells_for_session(session_id: str, session_data: dict):
     if operation in ["intersection", "union"] and query_a:
         try:
             if operation == "intersection" and query_b:
-                result_relation = engine.intersection(query_a, query_b)
+                # Erst union() auf beide Sets, dann intersection()
+                union_a = engine.union(query_a)
+                union_b = engine.union(query_b)
+                result_relation = engine.intersection(union_a, union_b)
                 count = engine.rendering_register_result(session_id, result_relation)
                 print(f"[precompute] Session {session_id}: Result (intersection) has {count} cells")
             elif operation == "union":

@@ -8,40 +8,44 @@ db = H3Engine("data/swissNAMES3D_combined_h3.duckdb")
 # ---------------------------------------------------------------------------
 
 # Filter als wiederverwendbare Relations
-flurnamen = db.features.filter("OBJEKTART = 'Flurname swisstopo'")
+sakgeb = db.features.filter("OBJEKTART = 'Sakrales Gebaeude'")
 orte = db.features.filter("OBJEKTART = 'Ort'")
-fliessgewaesser = db.features.filter("OBJEKTART = 'Fliessgewaesser'")
 
 # Counts via Relational API
-print(flurnamen.aggregate("count(*) as n, sum(h3_cell_count) as cells").df())
+print(sakgeb.aggregate("count(*) as n, sum(h3_cell_count) as cells").df())
 print(orte.aggregate("count(*) as n, sum(h3_cell_count) as cells").df())
-print(fliessgewaesser.aggregate("count(*) as n, sum(h3_cell_count) as cells").df())
 
 # Resolutions pro Kategorie
 print(db.features
-    .filter("OBJEKTART IN ('Flurname swisstopo', 'Ort')")
+    .filter("OBJEKTART IN ('Sakrales Gebaeude', 'Ort')")
     .aggregate("OBJEKTART, min(h3_resolution) as min_res, max(h3_resolution) as max_res", "OBJEKTART")
     .df())
 
-print(fliessgewaesser
-      .aggregate("OBJEKTART, min(h3_resolution) as min_res, max(h3_resolution) as max_res", "OBJEKTART")
-      .df())
+# ---------------------------------------------------------------------------
+# Spatial Predicates (erfordern union() vor intersection())
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Spatial Predicates (akzeptieren Relations oder Strings)
-# ---------------------------------------------------------------------------
+# Erst union() auf beide Sets, dann intersection()
+union_sakgeb = db.union(sakgeb)
+union_orte = db.union(orte)
 
 start = time.time()
-intersection_result = db.intersection(flurnamen, orte)
+intersection_result = db.intersection(union_sakgeb, union_orte)
 cell_count = intersection_result.aggregate("count(*) as n").fetchone()[0]
 elapsed = time.time() - start
 print(f"Found {cell_count} intersecting cells in {elapsed:.2f} seconds.")
 
-start = time.time()
-intersection_result = db.intersection(orte, fliessgewaesser)
-cell_count = intersection_result.aggregate("count(*) as n").fetchone()[0]
-elapsed = time.time() - start
-print(f"Found {cell_count} intersecting cells in {elapsed:.2f} seconds.")
+# Area berechnen
+db.area(intersection_result)
+
+# Fliessgewaesser Beispiel (auskommentiert da fliessgewaesser nicht definiert)
+# fliessgewaesser = db.features.filter("OBJEKTART = 'Fliessgewaesser'")
+# union_fliessgewaesser = db.union(fliessgewaesser)
+# start = time.time()
+# intersection_result = db.intersection(union_orte, union_fliessgewaesser)
+# cell_count = intersection_result.aggregate("count(*) as n").fetchone()[0]
+# elapsed = time.time() - start
+# print(f"Found {cell_count} intersecting cells in {elapsed:.2f} seconds.")
 
 print(db.conn.execute('''
       SELECT ST_AsText(geometry)

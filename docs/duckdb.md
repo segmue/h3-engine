@@ -73,39 +73,65 @@ from engine import H3Engine
 db = H3Engine("data/swissNAMES3D_combined_h3.duckdb")
 ```
 
-### intersects(a, b) → bool
+### union(feature_set) → CellSet
 
-Prüft ob sich A und B überschneiden.
+Normalisiert ein FeatureSet auf eine einheitliche Resolution (die feinste im Set).
+Gibt ein CellSet mit Spalten `(cell, resolution)` zurück.
 
 ```python
-db.intersects("kategorie = 'Wald'", "kategorie = 'See'")
-db.intersects("feature_id = 123", "kanton = 'ZH'")
+cells_wald = db.union("kategorie = 'Wald'")
+cells_see = db.union("kategorie = 'See'")
+```
+
+### intersects(a, b) → bool
+
+Prüft ob sich zwei CellSets überschneiden. Erfordert vorheriges `union()`.
+
+```python
+cells_a = db.union("kategorie = 'Wald'")
+cells_b = db.union("kategorie = 'See'")
+db.intersects(cells_a, cells_b)
 ```
 
 ### within(a, b) → bool
 
-Prüft ob A vollständig in B liegt.
+Prüft ob CellSet A vollständig in CellSet B liegt. Erfordert vorheriges `union()`.
 
 ```python
-db.within("feature_id = 123", "kategorie = 'Kanton'")
+cells_a = db.union("feature_id = 123")
+cells_b = db.union("kategorie = 'Kanton'")
+db.within(cells_a, cells_b)
 ```
 
 ### contains(a, b) → bool
 
-Prüft ob A das gesamte B enthält. Inverse von `within`.
+Prüft ob CellSet A das gesamte CellSet B enthält. Inverse von `within`.
 
 ```python
-db.contains("kategorie = 'Kanton'", "feature_id = 123")
+cells_a = db.union("kategorie = 'Kanton'")
+cells_b = db.union("feature_id = 123")
+db.contains(cells_a, cells_b)
 ```
 
-### intersection(a, b) → (cells, resolution)
+### intersection(a, b) → CellSet
 
-Gibt die überschneidenden Cells zurück (auf der feineren Resolution).
+Berechnet die Intersection zweier CellSets. Erfordert vorheriges `union()`.
+Gibt ein CellSet mit Spalten `(cell, resolution)` zurück.
 
 ```python
-cells, res = db.intersection("kategorie = 'Wald'", "name = 'Zürichsee'")
-print(f"{len(cells)} Cells auf Resolution {res}")
-# → ['8a1234...', '8a1235...', ...]
+cells_wald = db.union("kategorie = 'Wald'")
+cells_see = db.union("name = 'Zürichsee'")
+result = db.intersection(cells_wald, cells_see)
+area = db.area(result)
+```
+
+### area(cell_set) → float
+
+Berechnet die Fläche eines CellSets in km².
+
+```python
+cells = db.union("kategorie = 'Wald'")
+db.area(cells)  # → 1234.56 km²
 ```
 
 ### Utilities

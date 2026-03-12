@@ -96,13 +96,15 @@ def compute_all(
     print(f"  Gesamtflaeche: {total_area:,.2f} km²  ({time.time()-t0:.1f}s)")
 
     # ------------------------------------------------------------------
-    # 3. Pro OBJEKTART: Flaeche (native Resolution, h3_cell_area)
+    # 3. Pro OBJEKTART: Union CellSets und Flaechen berechnen
     # ------------------------------------------------------------------
-    print(f"\nBerechne Flaechen pro OBJEKTART ({n} Stueck)...")
+    print(f"\nBerechne Unions und Flaechen pro OBJEKTART ({n} Stueck)...")
     t0 = time.time()
+    unions: dict[str, any] = {}  # Cache fuer union CellSets
     areas: dict[str, float] = {}
     for obj in objektarten:
-        areas[obj] = engine.area(engine.union(f"OBJEKTART = '{obj}'"))
+        unions[obj] = engine.union(f"OBJEKTART = '{obj}'")
+        areas[obj] = engine.area(unions[obj])
     elapsed = time.time() - t0
     print(f"  Fertig ({elapsed:.1f}s)")
 
@@ -111,7 +113,7 @@ def compute_all(
     print(f"    ... (Top 5 von {n})")
 
     # ------------------------------------------------------------------
-    # 4. Paarweise Intersection-Flaechen
+    # 4. Paarweise Intersection-Flaechen (nutzt gecachte unions)
     # ------------------------------------------------------------------
     pairs = list(combinations(objektarten, 2))
     n_pairs = len(pairs)
@@ -120,8 +122,9 @@ def compute_all(
     intersection_areas: dict[tuple[str, str], float] = {}
     t0 = time.time()
     for i, (obj_a, obj_b) in enumerate(pairs):
+        # Nutze gecachte unions fuer intersection
         intersection_areas[(obj_a, obj_b)] = engine.area(
-            engine.intersection(f"OBJEKTART = '{obj_a}'", f"OBJEKTART = '{obj_b}'")
+            engine.intersection(unions[obj_a], unions[obj_b])
         )
 
         # Fortschritt alle 100 Paare
@@ -187,9 +190,9 @@ def compute_all(
     if output_dir:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-        npmi_df.to_csv(out / "npmi_matrix.csv")
-        b1_df.to_csv(out / "b1_matrix.csv")
-        b2_df.to_csv(out / "b2_matrix.csv")
+        npmi_df.to_csv(out / "npmi_matrix.csv", sep=";")
+        b1_df.to_csv(out / "b1_matrix.csv", sep=";")
+        b2_df.to_csv(out / "b2_matrix.csv", sep=";")
         print(f"\nMatrizen gespeichert in {out}/")
 
     engine.close()

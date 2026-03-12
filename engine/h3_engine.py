@@ -8,9 +8,12 @@ features Tabelle gespeichert und bei Bedarf via UNNEST expandiert.
 Geometrien werden als GEOMETRY-Typ gespeichert (via DuckDB Spatial Extension),
 was native Spatial Indexing und ST_* Funktionen ermoeglicht.
 
-Fuer allgemeine Queries wird DuckDB's Relational API direkt exponiert via
-db.features (DuckDBPyRelation). Spatial Predicates akzeptieren sowohl
-SQL WHERE-Strings als auch DuckDBPyRelation Objekte.
+Architektur (Lazy Evaluation):
+    - FeatureSet: SQL WHERE-String oder DuckDBPyRelation mit h3_cells Arrays
+    - CellSet: Lazy Query-Plan mit SQL-String und Resolution
+
+    Workflow: FeatureSet -> union() -> CellSet -> intersection/intersects/... -> CellSet
+    Ausfuehrung: area(CellSet) oder CellSet.run() materialisiert die Query
 
 Verwendung:
     from engine import H3Engine
@@ -20,29 +23,73 @@ Verwendung:
     # DuckDB Relational API fuer allgemeine Queries
     wald = db.features.filter("OBJEKTART = 'Wald'")
     wald.aggregate("count(*)").df()
-    wald.project("NAME, h3_resolution").order("NAME").limit(10).df()
 
-    # Spatial Predicates (str oder DuckDBPyRelation)
-    seen = db.features.filter("OBJEKTART = 'See'")
-    db.intersects(wald, seen)
-    db.intersects("OBJEKTART = 'Wald'", "OBJEKTART = 'See'")  # old-style
+    # FeatureSet -> CellSet via union() (LAZY - keine Ausfuehrung)
+    cells_wald = db.union("OBJEKTART = 'Wald'")
+    cells_seen = db.union("OBJEKTART = 'See'")
 
-    # Set-Operationen (geben DuckDBPyRelation mit 'cell' Spalte zurueck)
-    cells = db.intersection(wald, seen)
-    cells = db.union(wald)
+    # Set-Operationen (LAZY - baut nur Query-Plan)
+    result = db.intersection(cells_wald, cells_seen)
 
-    # Composable mit area():
-    db.area(db.intersection(wald, seen))
-    db.area(db.union(wald))
+    # Ausfuehrung (EAGER - fuehrt Query aus)
+    db.area(result)                    # Gibt float zurueck
+    db.intersects(cells_wald, cells_seen)  # Gibt bool zurueck
+    result.run()                       # Gibt DuckDBPyRelation zurueck
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Union
+from typing import Union, TYPE_CHECKING
 
 import duckdb
 
+if TYPE_CHECKING:
+    from h3_engine import H3Engine
+
 # Typ-Alias fuer Predicate-Argumente: SQL-String oder DuckDB Relation
 FeatureSet = Union[str, duckdb.DuckDBPyRelation]
+
+
+@dataclass
+class CellSet:
+    """Lazy Query-Plan fuer H3 Cells.
+
+    Enthaelt einen SQL-String der erst bei run()/area()/etc. ausgefuehrt wird.
+    Ermoeglicht Query-Komposition ohne Zwischenmaterialisierung.
+
+    Attributes:
+        sql: SQL-Query String (SELECT cell, resolution FROM ...)
+        resolution: Die (einheitliche) Resolution dieses CellSets
+        _engine: Referenz zur H3Engine fuer Query-Ausfuehrung
+    """
+
+    sql: str
+    resolution: int
+    _engine: "H3Engine"
+
+    def run(self) -> duckdb.DuckDBPyRelation:
+        """Fuehrt die Query aus und gibt eine DuckDBPyRelation zurueck."""
+        return self._engine.conn.sql(self.sql)
+
+    def df(self):
+        """Fuehrt die Query aus und gibt einen pandas DataFrame zurueck."""
+        return self.run().df()
+
+    def count(self) -> int:
+        """Zaehlt die Anzahl Cells (fuehrt Query aus)."""
+        result = self._engine.conn.execute(f"""
+            SELECT COUNT(*) FROM ({self.sql})
+        """).fetchone()
+        return result[0]
+
+    def __len__(self) -> int:
+        """Zaehlt die Anzahl Cells (fuehrt Query aus)."""
+        return self.count()
+
+    def __repr__(self) -> str:
+        return f"CellSet(resolution={self.resolution}, sql='{self.sql[:50]}...')"
 
 
 class H3Engine:
@@ -142,117 +189,109 @@ class H3Engine:
         return result[0], result[1]
 
     # -------------------------------------------------------------------------
-    # Boolean Predicates
+    # Boolean Predicates (EAGER - fuehren Query aus)
     # -------------------------------------------------------------------------
 
-    def intersects(self, a: FeatureSet, b: FeatureSet) -> bool:
+    def intersects(self, a: CellSet, b: CellSet) -> bool:
         """
-        Prueft ob die Features von A und B sich ueberschneiden.
+        Prueft ob zwei CellSets sich ueberschneiden.
+
+        EAGER: Fuehrt die Query sofort aus.
 
         Args:
-            a: Feature-Set A (SQL WHERE-String oder DuckDBPyRelation)
-            b: Feature-Set B (SQL WHERE-String oder DuckDBPyRelation)
+            a: CellSet A (von union())
+            b: CellSet B (von union())
 
         Returns:
             True wenn mindestens eine Cell von A mit einer Cell von B matched
 
         Example:
-            wald = db.features.filter("OBJEKTART = 'Wald'")
-            seen = db.features.filter("OBJEKTART = 'See'")
-            db.intersects(wald, seen)
-            db.intersects("OBJEKTART = 'Wald'", "OBJEKTART = 'See'")
+            cells_a = db.union("OBJEKTART = 'Wald'")
+            cells_b = db.union("OBJEKTART = 'See'")
+            db.intersects(cells_a, cells_b)
         """
-        expr_a = self._to_table_expr(a)
-        expr_b = self._to_table_expr(b)
+        # Resolution aus CellSets (keine Query noetig)
+        target_res = min(a.resolution, b.resolution)
 
-        try:
-            min_a, max_a = self._get_resolution_range(expr_a)
-            min_b, max_b = self._get_resolution_range(expr_b)
+        # Query mit CTEs zusammenbauen und ausfuehren
+        result = self.conn.execute(f"""
+            WITH a_cells AS ({a.sql}),
+                 b_cells AS ({b.sql}),
+                 a_parents AS (
+                     SELECT DISTINCT h3_cell_to_parent(cell, {target_res}) as parent
+                     FROM a_cells
+                 ),
+                 b_parents AS (
+                     SELECT DISTINCT h3_cell_to_parent(cell, {target_res}) as parent
+                     FROM b_cells
+                 )
+            SELECT 1
+            FROM a_parents
+            JOIN b_parents ON a_parents.parent = b_parents.parent
+            LIMIT 1
+        """).fetchone()
 
-            if min_a is None or min_b is None:
-                return False
+        return result is not None
 
-            target_res = min(min_a, min_b)
-
-            result = self.conn.execute(f"""
-                WITH a_parents AS (
-                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as parent
-                    FROM {expr_a}
-                ),
-                b_parents AS (
-                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as parent
-                    FROM {expr_b}
-                )
-                SELECT 1
-                FROM a_parents
-                JOIN b_parents ON a_parents.parent = b_parents.parent
-                LIMIT 1
-            """).fetchone()
-
-            return result is not None
-        finally:
-            self._cleanup_views(a, b)
-
-    def within(self, a: FeatureSet, b: FeatureSet) -> bool:
+    def within(self, a: CellSet, b: CellSet) -> bool:
         """
-        Prueft ob alle Cells von A innerhalb von B liegen.
+        Prueft ob alle Cells von CellSet A innerhalb von CellSet B liegen.
+
+        EAGER: Fuehrt die Query sofort aus.
 
         Args:
-            a: Feature-Set A, das "innere" (SQL WHERE-String oder DuckDBPyRelation)
-            b: Feature-Set B, das "aeussere" (SQL WHERE-String oder DuckDBPyRelation)
+            a: CellSet A, das "innere" (von union())
+            b: CellSet B, das "aeussere" (von union())
 
         Returns:
             True wenn alle Cells von A in B enthalten sind
 
         Example:
-            db.within("feature_id = 123", db.features.filter("OBJEKTART = 'Kanton'"))
+            cells_a = db.union("feature_id = 123")
+            cells_b = db.union("OBJEKTART = 'Kanton'")
+            db.within(cells_a, cells_b)
         """
-        expr_a = self._to_table_expr(a)
-        expr_b = self._to_table_expr(b)
+        # Resolution aus CellSets (keine Query noetig)
+        target_res = min(a.resolution, b.resolution)
 
-        try:
-            min_a, max_a = self._get_resolution_range(expr_a)
-            min_b, max_b = self._get_resolution_range(expr_b)
+        # Query mit CTEs zusammenbauen und ausfuehren
+        result = self.conn.execute(f"""
+            WITH a_cells AS ({a.sql}),
+                 b_cells AS ({b.sql}),
+                 a_parents AS (
+                     SELECT DISTINCT h3_cell_to_parent(cell, {target_res}) as cell
+                     FROM a_cells
+                 ),
+                 b_parents AS (
+                     SELECT DISTINCT h3_cell_to_parent(cell, {target_res}) as cell
+                     FROM b_cells
+                 )
+            SELECT COUNT(*)
+            FROM a_parents
+            WHERE cell NOT IN (SELECT cell FROM b_parents)
+        """).fetchone()
 
-            if min_a is None or min_b is None:
-                return False
+        return result[0] == 0
 
-            target_res = min(min_a, min_b)
-
-            result = self.conn.execute(f"""
-                WITH a_cells AS (
-                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
-                    FROM {expr_a}
-                ),
-                b_cells AS (
-                    SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
-                    FROM {expr_b}
-                )
-                SELECT COUNT(*)
-                FROM a_cells
-                WHERE cell NOT IN (SELECT cell FROM b_cells)
-            """).fetchone()
-
-            return result[0] == 0
-        finally:
-            self._cleanup_views(a, b)
-
-    def contains(self, a: FeatureSet, b: FeatureSet) -> bool:
+    def contains(self, a: CellSet, b: CellSet) -> bool:
         """
-        Prueft ob A alle Cells von B enthaelt.
+        Prueft ob CellSet A alle Cells von CellSet B enthaelt.
 
         Dies ist das Inverse von within(): contains(A, B) == within(B, A)
 
+        EAGER: Fuehrt die Query sofort aus.
+
         Args:
-            a: Feature-Set A, das "aeussere" (SQL WHERE-String oder DuckDBPyRelation)
-            b: Feature-Set B, das "innere" (SQL WHERE-String oder DuckDBPyRelation)
+            a: CellSet A, das "aeussere" (von union())
+            b: CellSet B, das "innere" (von union())
 
         Returns:
             True wenn alle Cells von B in A enthalten sind
 
         Example:
-            kanton = db.features.filter("OBJEKTART = 'Kanton'")
-            db.contains(kanton, "feature_id = 123")
+            cells_a = db.union("OBJEKTART = 'Kanton'")
+            cells_b = db.union("feature_id = 123")
+            db.contains(cells_a, cells_b)
         """
         return self.within(b, a)
 
@@ -260,131 +299,123 @@ class H3Engine:
     # Set-Operationen (geben DuckDBPyRelation mit 'cell' Spalte zurueck)
     # -------------------------------------------------------------------------
 
-    def intersection(self, a: FeatureSet, b: FeatureSet) -> duckdb.DuckDBPyRelation:
+    def intersection(self, a: CellSet, b: CellSet) -> CellSet:
         """
-        Berechnet die Intersection von A und B.
+        Berechnet die Intersection von zwei CellSets.
 
-        Gibt eine DuckDBPyRelation mit 'cell' Spalte (UBIGINT) zurueck,
-        normalisiert auf die feinste vorkommende Resolution.
-        Composable mit area(): engine.area(engine.intersection(a, b))
+        LAZY: Baut nur den Query-Plan, fuehrt nicht aus.
+        Verwendet SQL-String-Komposition mit CTEs.
 
         Args:
-            a: Feature-Set A (SQL WHERE-String oder DuckDBPyRelation)
-            b: Feature-Set B (SQL WHERE-String oder DuckDBPyRelation)
+            a: CellSet A (von union())
+            b: CellSet B (von union())
 
         Returns:
-            DuckDBPyRelation mit 'cell' Spalte (UBIGINT)
+            CellSet (Lazy Query-Plan)
 
         Example:
-            db.area(db.intersection("OBJEKTART = 'Wald'", "OBJEKTART = 'See'"))
+            cells_a = db.union("OBJEKTART = 'Wald'")
+            cells_b = db.union("OBJEKTART = 'See'")
+            result = db.intersection(cells_a, cells_b)  # Lazy
+            db.area(result)  # Fuehrt Query aus
         """
-        expr_a = self._to_table_expr(a)
-        expr_b = self._to_table_expr(b)
-
-        min_a, max_a = self._get_resolution_range(expr_a)
-        min_b, max_b = self._get_resolution_range(expr_b)
-
-        if min_a is None or min_b is None:
-            return self.conn.sql("SELECT NULL::UBIGINT as cell WHERE false")
+        # Resolution aus den CellSets (bereits bekannt, keine Query noetig)
+        res_a = a.resolution
+        res_b = b.resolution
 
         # Join auf der groeberen Resolution
-        target_res = min(min_a, min_b)
+        target_res = min(res_a, res_b)
+        # Ergebnis auf der feineren Resolution
+        finest_res = max(res_a, res_b)
 
-        # Feinste Resolution im Gesamtresultat (fuer Normalisierung)
-        finest_res = max(max_a, max_b)
-
-        # Bestimme welche Seite die feinere ist
-        if max_a >= max_b:
-            fine_expr = expr_a
-            coarse_expr = expr_b
+        # Bestimme welche Seite feiner/groeber ist
+        if res_a >= res_b:
+            fine_sql, coarse_sql = a.sql, b.sql
         else:
-            fine_expr = expr_b
-            coarse_expr = expr_a
+            fine_sql, coarse_sql = b.sql, a.sql
 
-        return self.conn.sql(f"""
-            WITH coarse_cells AS (
-                SELECT DISTINCT h3_cell_to_parent(UNNEST(h3_cells), {target_res}) as cell
-                FROM {coarse_expr}
-            ),
-            intersection_raw AS (
-                SELECT fine.cell, fine.res
-                FROM (
-                    SELECT UNNEST(h3_cells) as cell, h3_resolution as res
-                    FROM {fine_expr}
-                ) fine
-                WHERE h3_cell_to_parent(fine.cell, {target_res})
-                      IN (SELECT cell FROM coarse_cells)
-            )
-            SELECT DISTINCT cell FROM (
-                SELECT cell
-                FROM intersection_raw
-                WHERE res = {finest_res}
+        # SQL-String zusammenbauen mit CTEs
+        sql = f"""
+            WITH a_cells AS ({a.sql}),
+                 b_cells AS ({b.sql}),
+                 coarse_parents AS (
+                     SELECT DISTINCT h3_cell_to_parent(cell, {target_res}) as parent
+                     FROM {"a_cells" if res_a <= res_b else "b_cells"}
+                 ),
+                 fine_matched AS (
+                     SELECT cell
+                     FROM {"b_cells" if res_a <= res_b else "a_cells"}
+                     WHERE h3_cell_to_parent(cell, {target_res}) IN (SELECT parent FROM coarse_parents)
+                 )
+            SELECT DISTINCT cell, {finest_res}::TINYINT as resolution
+            FROM fine_matched
+        """
 
-                UNION ALL
-
-                SELECT UNNEST(h3_cell_to_children(cell, {finest_res}))
-                FROM intersection_raw
-                WHERE res < {finest_res}
-            )
-        """)
+        return CellSet(sql=sql, resolution=finest_res, _engine=self)
 
     # -------------------------------------------------------------------------
     # Area / Messung
     # -------------------------------------------------------------------------
 
-    def union(self, feature_set: FeatureSet) -> duckdb.DuckDBPyRelation:
+    def union(self, feature_set: FeatureSet) -> CellSet:
         """Normalisiert alle Cells eines Feature-Sets auf die feinste Resolution.
 
+        LAZY: Baut nur den Query-Plan, fuehrt nicht aus.
         Expandiert groebere Cells via h3_cell_to_children() und
         dedupliziert, um eine korrekte Union ohne Doppelzaehlung zu erhalten.
-        Composable mit area(): engine.area(engine.union(feature_set))
 
         Args:
             feature_set: SQL WHERE-String oder DuckDBPyRelation
 
         Returns:
-            DuckDBPyRelation mit 'cell' Spalte (UBIGINT)
+            CellSet (Lazy Query-Plan)
+
+        Example:
+            cells = db.union("OBJEKTART = 'Wald'")  # Lazy
+            cells.run()  # Fuehrt Query aus
+            db.area(cells)  # Fuehrt Query aus und berechnet Flaeche
         """
         expr = self._to_table_expr(feature_set)
         min_res, max_res = self._get_resolution_range(expr)
 
         if max_res is None:
-            return self.conn.sql("SELECT NULL::UBIGINT as cell WHERE false")
+            sql = "SELECT NULL::UBIGINT as cell, NULL::TINYINT as resolution WHERE false"
+            return CellSet(sql=sql, resolution=0, _engine=self)
 
         # Alle Resolutions gleich: keine Normalisierung noetig
         if min_res == max_res:
-            return self.conn.sql(f"""
-                SELECT DISTINCT UNNEST(h3_cells) as cell
+            sql = f"""
+                SELECT DISTINCT UNNEST(h3_cells) as cell, {max_res}::TINYINT as resolution
                 FROM {expr}
-            """)
-
-        # Normalisierung: Coarse Cells zu Children auf feinster Resolution expandieren
-        return self.conn.sql(f"""
-            SELECT DISTINCT cell FROM (
-                SELECT UNNEST(h3_cells) as cell
-                FROM {expr}
-                WHERE h3_resolution = {max_res}
-
-                UNION ALL
-
-                SELECT UNNEST(h3_cell_to_children(cell, {max_res}))
-                FROM (
+            """
+        else:
+            # Normalisierung: Coarse Cells zu Children auf feinster Resolution expandieren
+            sql = f"""
+                SELECT DISTINCT cell, {max_res}::TINYINT as resolution FROM (
                     SELECT UNNEST(h3_cells) as cell
                     FROM {expr}
-                    WHERE h3_resolution < {max_res}
-                ) coarse
-            )
-        """)
+                    WHERE h3_resolution = {max_res}
 
-    def area(self, cell_set: FeatureSet, unit: str = "km^2") -> float:
-        """Berechnet die Flaeche einer Menge von H3 Cells.
+                    UNION ALL
 
-        Akzeptiert:
-          - DuckDBPyRelation mit 'cell' Spalte (von union()/intersection())
-          - FeatureSet (SQL-String oder Relation mit h3_cells) fuer einzelne Features
+                    SELECT UNNEST(h3_cell_to_children(cell, {max_res}))
+                    FROM (
+                        SELECT UNNEST(h3_cells) as cell
+                        FROM {expr}
+                        WHERE h3_resolution < {max_res}
+                    ) coarse
+                )
+            """
+
+        return CellSet(sql=sql, resolution=max_res, _engine=self)
+
+    def area(self, cell_set: CellSet, unit: str = "km^2") -> float:
+        """Berechnet die Flaeche eines CellSets.
+
+        EAGER: Fuehrt die Query sofort aus.
 
         Args:
-            cell_set: Cell-Relation oder FeatureSet
+            cell_set: CellSet (von union() oder intersection())
             unit: Flaecheneinheit ('km^2' oder 'm^2')
 
         Returns:
@@ -392,36 +423,17 @@ class H3Engine:
 
         Example:
             db.area(db.union("OBJEKTART = 'Wald'"))
-            db.area(db.intersection(wald, seen))
-            db.area("feature_id = 123")  # einzelnes Feature
+            cells_a = db.union("OBJEKTART = 'Wald'")
+            cells_b = db.union("OBJEKTART = 'See'")
+            db.area(db.intersection(cells_a, cells_b))
         """
-        # Cell-Relation von union()/intersection(): hat 'cell' Spalte
-        if (isinstance(cell_set, duckdb.DuckDBPyRelation)
-                and 'cell' in cell_set.columns):
-            view = self._to_table_expr(cell_set)
-            try:
-                result = self.conn.execute(f"""
-                    SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
-                    FROM {view}
-                """).fetchone()
-                return result[0]
-            finally:
-                self._cleanup_views(cell_set)
-
-        # FeatureSet: Cells unnesten (fuer einzelne Features / eine Resolution)
-        expr = self._to_table_expr(cell_set)
-        try:
-            result = self.conn.execute(f"""
-                WITH distinct_cells AS (
-                    SELECT DISTINCT UNNEST(h3_cells) as cell
-                    FROM {expr}
-                )
-                SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
-                FROM distinct_cells
-            """).fetchone()
-            return result[0]
-        finally:
-            self._cleanup_views(cell_set)
+        # Query mit CTE zusammenbauen und ausfuehren
+        result = self.conn.execute(f"""
+            WITH cells AS ({cell_set.sql})
+            SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
+            FROM cells
+        """).fetchone()
+        return result[0]
 
     def total_area(self, resolution: int = 8, unit: str = "km^2") -> float:
         """Berechnet die Gesamtflaeche des Datensatzes (vereinfacht).
