@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "H3-Engine"
 version = "0.1.0"
-description = "Vector to DGGS (H3, S2) conversion and spatial operations for master thesis"
+description = "Vector to H3 conversion and spatial operations"
 authors = ["Your Name <your.email@example.com>"]
 readme = "readme.md"
 package-mode = false

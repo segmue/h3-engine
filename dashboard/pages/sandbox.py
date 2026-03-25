@@ -70,6 +70,7 @@ sandbox_sidebar = ui.sidebar(
         ui.input_action_button("run_intersects", "Intersects", class_="btn-outline-secondary btn-sm"),
         ui.input_action_button("run_within", "A within B", class_="btn-outline-secondary btn-sm"),
         ui.input_action_button("run_contains", "A contains B", class_="btn-outline-secondary btn-sm"),
+        ui.input_action_button("run_intersects_features", "A ∩ B Features", class_="btn-outline-info btn-sm"),
         style="display:flex;flex-direction:column;gap:2px;align-items:center;margin-top:12px;"
     ),
 
@@ -335,6 +336,68 @@ def sandbox_server(input: Inputs, output: Outputs, session: Session):
             log(f"Contains check failed: {e}", "error")
             add_notification(f"Contains check failed: {e}", "error")
 
+    @reactive.Effect
+    @reactive.event(input.run_intersects_features)
+    def run_intersects_features():
+        """Find features from B that spatially intersect with A's cells."""
+        query_a = input.query_a()
+        query_b = input.query_b()
+        if not query_a or not query_b:
+            add_notification("Enter queries A and B first", "warning")
+            return
+
+        log("Finding B features that intersect with A...")
+        clear_notifications()
+
+        try:
+            start_time = time.time()
+
+            # 1. Compute stats for A
+            sa = _query_stats(query_a)
+            stats_a.set(sa)
+            log(f"Query A: {sa['count']} features")
+
+            # 2. Get cells from Query A
+            union_a = engine.union(query_a)
+
+            # 3. Build predicate for intersection
+            predicate = engine.intersects_predicate(union_a)
+
+            # 4. Filter B features that intersect with A
+            intersecting_query = f"({query_b}) AND {predicate}"
+            intersecting_count = engine.features.filter(intersecting_query).aggregate("count(*)").fetchone()[0]
+
+            elapsed = time.time() - start_time
+            operation_elapsed_time.set(elapsed)
+
+            # 5. Update stats for B (showing filtered count)
+            sb_original = _query_stats(query_b)
+            stats_b.set({
+                "count": intersecting_count,
+                "resolutions": sb_original["resolutions"],
+                "original_count": sb_original["count"]
+            })
+
+            operation_result.set({
+                "type": "features",
+                "count": intersecting_count,
+                "original": sb_original["count"],
+                "label": "A ∩ B Features"
+            })
+            log(f"Found {intersecting_count} of {sb_original['count']} B features intersecting with A", "success")
+
+            queries_loaded.set(True)
+
+            # 6. Register with tile server - show A cells and filtered B features
+            session_id = register_query_with_server(query_a, intersecting_query, "none")
+            if session_id:
+                result_session_id.set(session_id)
+                log(f"Registered session: {session_id}", "success")
+
+        except Exception as e:
+            log(f"Intersects features failed: {e}", "error")
+            add_notification(f"Intersects features failed: {e}", "error")
+
     # ========================================================================
     # Renderers
     # ========================================================================
@@ -366,6 +429,8 @@ def sandbox_server(input: Inputs, output: Outputs, session: Session):
                 lines.append(f"{op_res['label']}: {op_res['value']}")
             elif op_res["type"] == "cells":
                 lines.append(f"{op_res['label']}: {op_res['area']:.2f} km2")
+            elif op_res["type"] == "features":
+                lines.append(f"{op_res['label']}: {op_res['count']}/{op_res['original']}")
 
         if op_time is not None:
             lines.append(f"Time: {op_time:.3f}s")

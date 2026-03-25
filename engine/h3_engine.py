@@ -511,3 +511,48 @@ FROM unique_cells;
             ORDER BY h3_resolution
         """).fetchall()
         return [row[0] for row in result]
+
+    # -------------------------------------------------------------------------
+    # Predicate Builders
+    # -------------------------------------------------------------------------
+
+    def intersects_predicate(self, cell_set: CellSet) -> str:
+        """Gibt ein SQL-Praedikat zurueck fuer Features die mit dem CellSet intersecten.
+
+        LAZY: Gibt nur einen SQL-String zurueck, fuehrt keine Query aus.
+        Das Praedikat kann mit der DuckDB Relational API kombiniert werden.
+
+        Resolution-Handling:
+            Da Features verschiedene Resolutions haben koennen, wird fuer jeden
+            Vergleich die groebere Resolution verwendet (wie bei intersection()).
+            LEAST(f.h3_resolution, cell_set.resolution) waehlt dynamisch die
+            passende Resolution pro Feature.
+
+        Args:
+            cell_set: CellSet (von union())
+
+        Returns:
+            SQL-String der als WHERE-Bedingung nutzbar ist
+
+        Example:
+            # Alle Strassen die mit dem Matterhorn intersecten
+            matterhorn_cells = db.union("feature_id = 123")
+            predicate = db.intersects_predicate(matterhorn_cells)
+            strassen = db.features.filter(f"OBJEKTART = 'Strasse' AND {predicate}")
+
+            # Kombiniert mit weiteren Bedingungen
+            db.features.filter(f"NAME IS NOT NULL AND {predicate}").limit(10).df()
+        """
+        # LEAST() waehlt die groebere Resolution (kleinere Zahl = groeber)
+        # Beide Seiten werden auf diese Resolution normalisiert via h3_cell_to_parent()
+        return f"""
+            feature_id IN (
+                WITH target_cells AS ({cell_set.sql})
+                SELECT DISTINCT f.feature_id
+                FROM features f,
+                     LATERAL (SELECT UNNEST(f.h3_cells) as cell) fc,
+                     target_cells tc
+                WHERE h3_cell_to_parent(fc.cell, LEAST(f.h3_resolution, {cell_set.resolution}))
+                    = h3_cell_to_parent(tc.cell, LEAST(f.h3_resolution, {cell_set.resolution}))
+            )
+        """

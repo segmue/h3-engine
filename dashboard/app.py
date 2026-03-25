@@ -27,6 +27,7 @@ from shiny import App, Inputs, Outputs, Session, ui
 from dashboard.config import log
 from dashboard.pages.sandbox import sandbox_ui, sandbox_server
 from dashboard.pages.association import association_ui, association_server
+from dashboard.pages.sentence_gen import sentence_gen_ui, sentence_gen_server
 
 
 # ============================================================================
@@ -37,6 +38,7 @@ app_ui = ui.page_fluid(
     ui.navset_tab(
         ui.nav_panel("H3 Engine Sandbox", sandbox_ui),
         ui.nav_panel("Spatial Association", association_ui),
+        ui.nav_panel("Sentence Generator", sentence_gen_ui),
         id="main_tabs"
     ),
 )
@@ -53,6 +55,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     # Initialize page servers
     sandbox_server(input, output, session)
     association_server(input, output, session)
+    sentence_gen_server(input, output, session)
 
     log("Dashboard ready", "success")
 
