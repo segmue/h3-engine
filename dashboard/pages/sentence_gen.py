@@ -8,13 +8,14 @@ basierend auf der B1 Association Matrix und H3 Spatial Intersection.
 from shiny import Inputs, Outputs, Session, ui, render, reactive
 
 from engine import H3Engine
-from sentence_generator import CandidateSentenceGenerator, FeatureInput
+from sentence_generator import CandidateSentenceGenerator, FeatureInput, SentenceGeneratorConfig
 from dashboard.config import DB_PATH
 
 
 # Engine und Generator initialisieren (einmal pro Modul-Load)
 engine = H3Engine(DB_PATH)
-generator = CandidateSentenceGenerator(engine)
+config = SentenceGeneratorConfig.from_config_yaml()
+generator = CandidateSentenceGenerator(engine, config)
 
 
 # -----------------------------------------------------------------------------

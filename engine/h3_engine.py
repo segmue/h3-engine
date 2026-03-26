@@ -568,6 +568,9 @@ class H3Engine:
         objektart_list: list[str] | None = None,
         dataset: str | None = None,
         exclude_id: int | None = None,
+        exclude_ids: list[int] | None = None,
+        order_by_size: bool = False,
+        max_results: int | None = None,
     ) -> duckdb.DuckDBPyRelation:
         """Findet alle Features die mit einem gegebenen Feature raeumlich intersecten.
 
@@ -578,7 +581,10 @@ class H3Engine:
             feature_id: ID des Quell-Features
             objektart_list: Optionale Liste von OBJEKTART-Werten zum Filtern
             dataset: Optionaler Dataset-Filter (z.B. 'swissnames3d')
-            exclude_id: Feature-ID die ausgeschlossen werden soll (meist = feature_id)
+            exclude_id: Feature-ID die ausgeschlossen werden soll
+            exclude_ids: Liste von Feature-IDs die ausgeschlossen werden sollen
+            order_by_size: Wenn True, nach Feature-Groesse sortieren (absteigend)
+            max_results: Maximale Anzahl Ergebnisse
 
         Returns:
             DuckDBPyRelation mit Spalten: feature_id, NAME, OBJEKTART, dataset
@@ -598,7 +604,22 @@ class H3Engine:
             where_parts.append(f"f.dataset = '{dataset}'")
         if exclude_id is not None:
             where_parts.append(f"f.feature_id != {int(exclude_id)}")
+        if exclude_ids:
+            ids_str = ", ".join(str(int(i)) for i in exclude_ids)
+            where_parts.append(f"f.feature_id NOT IN ({ids_str})")
         where_clause = " AND ".join(where_parts)
+
+        order_clause = ""
+        if order_by_size:
+            # Groesse = Anzahl Cells * Flaeche pro Cell bei der jeweiligen Resolution
+            # ASC: kleinste Features zuerst (spezifischer, lokaler Kontext)
+            order_clause = """
+                ORDER BY f.h3_cell_count * h3_cell_area(
+                    h3_cell_to_parent(0, f.h3_resolution), 'km^2'
+                ) ASC
+            """
+
+        limit_clause = f"LIMIT {int(max_results)}" if max_results else ""
 
         sql = f"""
             WITH source AS (
@@ -633,6 +654,8 @@ class H3Engine:
             FROM all_matches m
             JOIN features f ON m.feature_id = f.feature_id
             WHERE {where_clause}
+            {order_clause}
+            {limit_clause}
         """
 
         return self.conn.sql(sql)

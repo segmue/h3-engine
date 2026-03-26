@@ -1,5 +1,5 @@
 from engine import H3Engine
-from sentence_generator import CandidateSentenceGenerator, FeatureInput
+from sentence_generator import CandidateSentenceGenerator, FeatureInput, SentenceGeneratorConfig
 import time
 
 # ---------------------------------------------------------------------------
@@ -7,7 +7,11 @@ import time
 # ---------------------------------------------------------------------------
 
 db = H3Engine("data/swissNAMES3D_combined_h3.duckdb")
-generator = CandidateSentenceGenerator(db)
+config = SentenceGeneratorConfig.from_config_yaml()
+generator = CandidateSentenceGenerator(db, config)
+
+print(f"Target Dataset: {config.target_dataset}")
+print(f"Static Datasets: {[(ds.name, ds.label, ds.slots) for ds in config.static_datasets]}")
 
 # ---------------------------------------------------------------------------
 # B1 Matrix laden und Assoziationen anschauen
@@ -32,7 +36,7 @@ results = db.conn.execute("""
     LIMIT 10
 """).fetchall()
 
-feature_id, name, objektart = results[7]
+feature_id, name, objektart = results[4]
 print(f"\nTest-Feature: {name} ({objektart}, ID={feature_id})")
 
 # ---------------------------------------------------------------------------

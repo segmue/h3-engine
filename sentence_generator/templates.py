@@ -50,27 +50,55 @@ class SentenceTemplate:
         self,
         name: str,
         objektart: str,
-        static_context: Optional[Dict[str, List[str]]] = None,
         context_by_category: Optional[Dict[str, List[str]]] = None,
+        filler_by_category: Optional[Dict[str, List[str]]] = None,
+        static_context: Optional[Dict[str, List[str]]] = None,
     ) -> str:
         """Baut den kompletten beschreibenden Satz.
+
+        Reihenfolge:
+            1. Assoziations-basierter Kontext (context_by_category)
+            2. Filler-Kontext (filler_by_category, restliche Slots)
+            3. Statischer Kontext (static_context, z.B. Gemeinde/Kanton)
 
         Args:
             name: Name des Haupt-Features
             objektart: OBJEKTART des Haupt-Features
+            context_by_category: Dict von {OBJEKTART: [Namen]} aus Assoziationsmatrix
+            filler_by_category: Dict von {OBJEKTART: [Namen]} fuer Filler-Slots
             static_context: Dict von {Label: [Namen]} fuer statischen Kontext
-                            z.B. {'Gemeinde': ['Zermatt'], 'Kanton': ['Wallis']}
-            context_by_category: Dict von {OBJEKTART: [Namen]} fuer dynamischen Kontext
 
         Returns:
             Kompletter Satz, z.B.:
-            'Alpiner Gipfel "Matterhorn" in Zermatt (Gemeinde). Bei Zmuttgrat (Grat)'
+            'Alpiner Gipfel "Matterhorn" bei Zmuttgrat (Grat). Nahe Theodulpass (Pass). In Zermatt (Gemeinde)'
         """
         feature_part = self.format_feature(name, objektart)
 
         parts = []
 
-        # Static Context: "in Zermatt (Gemeinde), Wallis (Kanton)"
+        # 1. Assoziations-basierter Kontext
+        if context_by_category:
+            items = []
+            for cat, names in context_by_category.items():
+                if names:
+                    formatted = self.format_category_group(cat, names)
+                    if formatted:
+                        items.append(formatted)
+            if items:
+                parts.append("bei " + self.config.category_separator.join(items))
+
+        # 2. Filler-Kontext (restliche Slots, kleinste Features)
+        if filler_by_category:
+            items = []
+            for cat, names in filler_by_category.items():
+                if names:
+                    formatted = self.format_category_group(cat, names)
+                    if formatted:
+                        items.append(formatted)
+            if items:
+                parts.append("nahe " + self.config.category_separator.join(items))
+
+        # 3. Statischer Kontext (Gemeinde, Kanton, etc.)
         if static_context:
             static_items = []
             for label, names in static_context.items():
@@ -78,17 +106,6 @@ class SentenceTemplate:
                     static_items.append(f"{n} ({label})")
             if static_items:
                 parts.append("in " + self.config.instance_separator.join(static_items))
-
-        # Dynamic Context: "bei Zmuttgrat (Grat); Theodulstrasse (Strasse)"
-        if context_by_category:
-            dynamic_items = []
-            for cat_objektart, names in context_by_category.items():
-                if names:
-                    formatted = self.format_category_group(cat_objektart, names)
-                    if formatted:
-                        dynamic_items.append(formatted)
-            if dynamic_items:
-                parts.append("bei " + self.config.category_separator.join(dynamic_items))
 
         if not parts:
             return feature_part
