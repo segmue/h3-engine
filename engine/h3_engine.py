@@ -382,28 +382,30 @@ class H3Engine:
             sql = "SELECT NULL::UBIGINT as cell, NULL::TINYINT as resolution WHERE false"
             return CellSet(sql=sql, resolution=0, _engine=self)
 
+        feature_ids_subquery = f"SELECT feature_id FROM {expr}"
+
         # Alle Resolutions gleich: keine Normalisierung noetig
         if min_res == max_res:
             sql = f"""
-                SELECT DISTINCT UNNEST(h3_cells) as cell, {max_res}::TINYINT as resolution
-                FROM {expr}
+                SELECT DISTINCT l.cell, {max_res}::TINYINT as resolution
+                FROM h3_lookup l
+                WHERE l.feature_id IN ({feature_ids_subquery})
             """
         else:
             # Normalisierung: Coarse Cells zu Children auf feinster Resolution expandieren
             sql = f"""
                 SELECT DISTINCT cell, {max_res}::TINYINT as resolution FROM (
-                    SELECT UNNEST(h3_cells) as cell
-                    FROM {expr}
-                    WHERE h3_resolution = {max_res}
+                    SELECT l.cell
+                    FROM h3_lookup l
+                    WHERE l.feature_id IN ({feature_ids_subquery})
+                    AND l.cell_res = {max_res}
 
                     UNION ALL
 
-                    SELECT UNNEST(h3_cell_to_children(cell, {max_res}))
-                    FROM (
-                        SELECT UNNEST(h3_cells) as cell
-                        FROM {expr}
-                        WHERE h3_resolution < {max_res}
-                    ) coarse
+                    SELECT UNNEST(h3_cell_to_children(l.cell, {max_res}))
+                    FROM h3_lookup l
+                    WHERE l.feature_id IN ({feature_ids_subquery})
+                    AND l.cell_res < {max_res}
                 )
             """
 
@@ -449,34 +451,25 @@ class H3Engine:
             Gesamtflaeche in der angegebenen Einheit
         """
         result = self.conn.execute(f"""
-            LOAD h3;
-
-WITH processed_arrays AS (
-    SELECT 
-        CASE 
-            -- Fall A: Zu fein (z.B. Res 11) -> Jedes Element im Array zu Parent Res 10
-            WHEN h3_resolution > {resolution} THEN 
-                list_transform(h3_cells, x -> h3_cell_to_parent(x, {resolution}))
-            
-            -- Fall B: Zu grob (z.B. Res 8) -> Jedes Element zu Kindern Res 10 (ergibt Liste von Listen)
-            -- flatten() macht daraus wieder ein einfaches Array
-            WHEN h3_resolution < {resolution} THEN 
-                flatten(list_transform(h3_cells, x -> h3_cell_to_children(x, {resolution})))
-            
-            -- Fall C: Bereits Res 10
-            ELSE h3_cells 
-        END AS normalized_array
-    FROM features
-),
-unique_cells AS (
-    -- Jetzt erst unnesten wir die bereits transformierten Arrays
-    -- DISTINCT verhindert Doppelzählungen überlappender Features
-    SELECT DISTINCT UNNEST(normalized_array) AS cell
-    FROM processed_arrays
-)
-SELECT 
-    COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0) AS total_area_km2
-FROM unique_cells;
+            WITH
+            exact AS (
+                SELECT cell FROM h3_lookup WHERE cell_res = {resolution}
+            ),
+            finer AS (
+                SELECT h3_cell_to_parent(cell, {resolution}) as cell
+                FROM h3_lookup WHERE cell_res > {resolution}
+            ),
+            coarser AS (
+                SELECT UNNEST(h3_cell_to_children(cell, {resolution})) as cell
+                FROM h3_lookup WHERE cell_res < {resolution}
+            ),
+            all_cells AS (
+                SELECT cell FROM exact
+                UNION ALL SELECT cell FROM finer
+                UNION ALL SELECT cell FROM coarser
+            )
+            SELECT COALESCE(SUM(h3_cell_area(cell, '{unit}')), 0)
+            FROM (SELECT DISTINCT cell FROM all_cells)
         """).fetchone()
         return result[0]
 
@@ -545,14 +538,174 @@ FROM unique_cells;
         """
         # LEAST() waehlt die groebere Resolution (kleinere Zahl = groeber)
         # Beide Seiten werden auf diese Resolution normalisiert via h3_cell_to_parent()
+        # Nutzt h3_lookup (flat, sortiert) statt LATERAL UNNEST auf features
         return f"""
             feature_id IN (
                 WITH target_cells AS ({cell_set.sql})
-                SELECT DISTINCT f.feature_id
-                FROM features f,
-                     LATERAL (SELECT UNNEST(f.h3_cells) as cell) fc,
+                SELECT DISTINCT l.feature_id
+                FROM h3_lookup l,
                      target_cells tc
-                WHERE h3_cell_to_parent(fc.cell, LEAST(f.h3_resolution, {cell_set.resolution}))
-                    = h3_cell_to_parent(tc.cell, LEAST(f.h3_resolution, {cell_set.resolution}))
+                WHERE h3_cell_to_parent(l.cell, LEAST(l.cell_res, {cell_set.resolution}))
+                    = h3_cell_to_parent(tc.cell, LEAST(l.cell_res, {cell_set.resolution}))
             )
         """
+
+    # -------------------------------------------------------------------------
+    # Lookup-basierte Intersection (schnell, nutzt h3_lookup Index)
+    # -------------------------------------------------------------------------
+
+    def _has_lookup_table(self) -> bool:
+        """Prueft ob die h3_lookup Tabelle existiert."""
+        result = self.conn.execute("""
+            SELECT COUNT(*) FROM information_schema.tables
+            WHERE table_name = 'h3_lookup'
+        """).fetchone()
+        return result[0] > 0
+
+    def find_intersecting_features(
+        self,
+        feature_id: int,
+        objektart_list: list[str] | None = None,
+        dataset: str | None = None,
+        exclude_id: int | None = None,
+    ) -> duckdb.DuckDBPyRelation:
+        """Findet alle Features die mit einem gegebenen Feature raeumlich intersecten.
+
+        Nutzt die vorberechnete h3_lookup Tabelle fuer schnelle Lookups.
+        Cross-Resolution wird ueber Source-Side h3_cell_to_parent() gehandelt.
+
+        Args:
+            feature_id: ID des Quell-Features
+            objektart_list: Optionale Liste von OBJEKTART-Werten zum Filtern
+            dataset: Optionaler Dataset-Filter (z.B. 'swissnames3d')
+            exclude_id: Feature-ID die ausgeschlossen werden soll (meist = feature_id)
+
+        Returns:
+            DuckDBPyRelation mit Spalten: feature_id, NAME, OBJEKTART, dataset
+        """
+        if not self._has_lookup_table():
+            raise RuntimeError(
+                "h3_lookup Tabelle nicht gefunden. "
+                "Bitte zuerst erstellen via scripts/convert_and_import.py"
+            )
+
+        # Build WHERE clauses for the final filter
+        where_parts = ["f.NAME IS NOT NULL"]
+        if objektart_list:
+            quoted = ", ".join(f"'{o}'" for o in objektart_list)
+            where_parts.append(f"f.OBJEKTART IN ({quoted})")
+        if dataset is not None:
+            where_parts.append(f"f.dataset = '{dataset}'")
+        if exclude_id is not None:
+            where_parts.append(f"f.feature_id != {int(exclude_id)}")
+        where_clause = " AND ".join(where_parts)
+
+        sql = f"""
+            WITH source AS (
+                SELECT cell, cell_res
+                FROM h3_lookup
+                WHERE feature_id = {int(feature_id)}
+            ),
+            coarser_matches AS (
+                SELECT DISTINCT l.feature_id
+                FROM h3_lookup l
+                JOIN (
+                    SELECT DISTINCT
+                        h3_cell_to_parent(s.cell, tr.cell_res) as parent_cell,
+                        tr.cell_res as target_res
+                    FROM source s,
+                         (SELECT DISTINCT cell_res FROM h3_lookup) tr
+                    WHERE tr.cell_res <= s.cell_res
+                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res
+            ),
+            finer_matches AS (
+                SELECT DISTINCT l.feature_id
+                FROM h3_lookup l
+                JOIN source s ON h3_cell_to_parent(l.cell, s.cell_res) = s.cell
+                WHERE l.cell_res > s.cell_res
+            ),
+            all_matches AS (
+                SELECT feature_id FROM coarser_matches
+                UNION
+                SELECT feature_id FROM finer_matches
+            )
+            SELECT DISTINCT f.feature_id, f.NAME, f.OBJEKTART, f.dataset
+            FROM all_matches m
+            JOIN features f ON m.feature_id = f.feature_id
+            WHERE {where_clause}
+        """
+
+        return self.conn.sql(sql)
+
+    def find_overlapping_features(
+        self,
+        feature_id: int,
+        dataset: str,
+        max_results: int = 5,
+    ) -> duckdb.DuckDBPyRelation:
+        """Findet Features aus einem Dataset die raeumlich ueberlappen,
+        gerankt nach Anzahl gemeinsamer H3-Cells (Overlap-Groesse).
+
+        Fuer Static Context: z.B. welche Gemeinde/Kanton ueberlappt am meisten.
+
+        Args:
+            feature_id: ID des Quell-Features
+            dataset: Dataset-Name zum Filtern (z.B. 'gemeinden')
+            max_results: Maximale Anzahl Ergebnisse
+
+        Returns:
+            DuckDBPyRelation mit Spalten: feature_id, NAME, dataset, overlap_cells
+        """
+        if not self._has_lookup_table():
+            raise RuntimeError(
+                "h3_lookup Tabelle nicht gefunden. "
+                "Bitte zuerst erstellen via scripts/convert_and_import.py"
+            )
+
+        sql = f"""
+            WITH source AS (
+                SELECT cell, cell_res
+                FROM h3_lookup
+                WHERE feature_id = {int(feature_id)}
+            ),
+            coarser_matches AS (
+                SELECT l.feature_id, COUNT(*) as overlap_cells
+                FROM h3_lookup l
+                JOIN (
+                    SELECT DISTINCT
+                        h3_cell_to_parent(s.cell, tr.cell_res) as parent_cell,
+                        tr.cell_res as target_res
+                    FROM source s,
+                         (SELECT DISTINCT cell_res FROM h3_lookup
+                          WHERE dataset = '{dataset}') tr
+                    WHERE tr.cell_res <= s.cell_res
+                ) sp ON l.cell = sp.parent_cell AND l.cell_res = sp.target_res
+                WHERE l.dataset = '{dataset}'
+                GROUP BY l.feature_id
+            ),
+            finer_matches AS (
+                SELECT l.feature_id, COUNT(*) as overlap_cells
+                FROM h3_lookup l
+                JOIN source s ON h3_cell_to_parent(l.cell, s.cell_res) = s.cell
+                WHERE l.cell_res > s.cell_res
+                AND l.dataset = '{dataset}'
+                GROUP BY l.feature_id
+            ),
+            all_matches AS (
+                SELECT feature_id, SUM(overlap_cells) as overlap_cells
+                FROM (
+                    SELECT * FROM coarser_matches
+                    UNION ALL
+                    SELECT * FROM finer_matches
+                )
+                GROUP BY feature_id
+            )
+            SELECT f.feature_id, f.NAME, f.dataset, m.overlap_cells
+            FROM all_matches m
+            JOIN features f ON m.feature_id = f.feature_id
+            WHERE f.NAME IS NOT NULL
+            ORDER BY m.overlap_cells DESC
+            LIMIT {int(max_results)}
+        """
+
+        return self.conn.sql(sql)

@@ -27,7 +27,7 @@ from .sentence_generator import (
     FeatureInput,
     GeneratedSentence,
 )
-from .config import SentenceGeneratorConfig
+from .config import SentenceGeneratorConfig, StaticDatasetConfig
 from .association_loader import AssociationMatrixLoader
 
 __all__ = [
@@ -35,5 +35,6 @@ __all__ = [
     "FeatureInput",
     "GeneratedSentence",
     "SentenceGeneratorConfig",
+    "StaticDatasetConfig",
     "AssociationMatrixLoader",
 ]

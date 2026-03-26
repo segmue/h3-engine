@@ -1,30 +1,61 @@
 # =============================================================================
 # H3 Multi-Datensatz Converter -- Konfiguration
 # =============================================================================
-# Verwendet von: scripts/convert_h3_multi.py
+# Verwendet von: scripts/convert_and_import.py
 # Das Skript liest diese Datei beim Start und fragt, ob die Defaults
 # verwendet werden sollen. Bei "n" werden alle Werte interaktiv eingegeben.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Input-Datensätze
+# Datasets
 # -----------------------------------------------------------------------------
-# Liste von Geodaten-Dateien die zusammengefuegt werden.
-# Alle Dateien muessen das gleiche Schema haben (Spalten werden appended).
-# Pfade relativ zum Verzeichnis von dem aus das Skript ausgefuehrt wird.
+# Jedes Dataset hat eine Rolle:
+#   target:          Kern-Datensatz, wird beschrieben. OBJEKTART in Assoziationsmatrix.
+#   static_context:  Statischer Kontext pro Feature (z.B. Gemeinde, Kanton).
+#                    Immer im Satz, fuellt keine Assoziations-Slots.
+#   dynamic_context: (Zukunft) Dynamischer Kontext via Assoziationsmatrix.
+#
+# name_field: Spalte die den Anzeigenamen enthaelt (wird zu NAME gemappt)
+# label:      Anzeige-Label im Satz (nur static_context/dynamic_context)
+# slots:      Max. Anzahl Features im Satz (nur static_context/dynamic_context)
 # -----------------------------------------------------------------------------
-input_files:
-  - data/swissNAMES3D_PLY.shp
-  - data/swissNAMES3D_LIN.shp
-  - data/swissNAMES3D_PKT.shp
+datasets:
+  - name: swissnames3d
+    role: target
+    files:
+      - data/swissNAMES3D_PLY.shp
+      - data/swissNAMES3D_LIN.shp
+      - data/swissNAMES3D_PKT.shp
+    name_field: NAME
+
+  - name: gemeinden
+    role: static_context
+    slots: 2
+    label: Gemeinde
+    files:
+      - data/swissboundaries3d_2026-01_2056_5728.shp/swissBOUNDARIES3D_1_5_TLM_HOHEITSGEBIET.shp
+    name_field: NAME
+
+  - name: kantone
+    role: static_context
+    slots: 1
+    label: Kanton
+    files:
+      - data/swissboundaries3d_2026-01_2056_5728.shp/swissBOUNDARIES3D_1_5_TLM_KANTONSGEBIET.shp
+    name_field: NAME
+
+  - name: bezirke
+    role: static_context
+    slots: 1
+    label: Bezirk
+    files:
+      - data/swissboundaries3d_2026-01_2056_5728.shp/swissBOUNDARIES3D_1_5_TLM_BEZIRKSGEBIET.shp
+    name_field: NAME
 
 # -----------------------------------------------------------------------------
 # Output
 # -----------------------------------------------------------------------------
-# Ausgabedatei im GPKG-Format.
-# Enthält alle zusammengefügten Zeilen + H3-Spalten.
-# -----------------------------------------------------------------------------
-output_file: data/swissNAMES3D_combined_h3.gpkg
+output_file: data/swissNAMES3D_combined_h3.duckdb
 
 # -----------------------------------------------------------------------------
 # H3 Konvertierungsparameter
@@ -36,21 +67,16 @@ output_file: data/swissNAMES3D_combined_h3.gpkg
 target_cells: 100
 
 # Minimale H3-Resolution fuer die adaptive Aufloesung (Polygone).
-# Grosse Polygone werden hier "eingedeckt" -- Resolution wird nicht
-# unter diesen Wert gedrückt.
 min_resolution: 5
 
 # Maximale H3-Resolution.
 #   - Polygone/MultiPolygone: obere Grenze der adaptiven Aufloesung.
-#     Sehr kleine Polygone fallen auf die Centroid-Methode bei dieser Resolution.
 #   - Punkte / Linien / MultiPoints / MultiLines: wird direkt verwendet.
 max_resolution: 13
 
 # Containment-Modus fuer die Polygon-zu-H3 Konvertierung.
-# Bestimmt, welche Zellen als "gehoerend zum Polygon" gelten.
-#
-#   center:       Nur Zellen, deren Mittelpunkt im Polygon liegt (klassisch)
+#   center:       Nur Zellen, deren Mittelpunkt im Polygon liegt
 #   full:         Nur Zellen, die vollstaendig im Polygon liegen
-#   overlap:      Jede Ueberschneidung zaehlt (empfohlen, volle Abdeckung)
-#   overlap_bbox: Bounding-Box Ueberschneidung (schneller, aber gröber)
+#   overlap:      Jede Ueberschneidung zaehlt (empfohlen)
+#   overlap_bbox: Bounding-Box Ueberschneidung (schneller, aber groeber)
 containment_mode: overlap

@@ -4,7 +4,21 @@ Konfiguration fuer den CandidateSentenceGenerator.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
+
+
+@dataclass
+class StaticDatasetConfig:
+    """Konfiguration fuer ein statisches Kontext-Dataset.
+
+    Attributes:
+        name: Dataset-Name in der DuckDB (z.B. 'gemeinden')
+        slots: Maximale Anzahl Features im Satz
+        label: Anzeige-Label im Satz (z.B. 'Gemeinde')
+    """
+    name: str
+    slots: int
+    label: str
 
 
 @dataclass
@@ -12,12 +26,14 @@ class SentenceGeneratorConfig:
     """Konfiguration fuer die Satzgenerierung.
 
     Attributes:
-        assoc_threshold: Minimaler B1-Wert fuer relevante Kategorien (default 0.05)
-        max_instances: Maximale Anzahl Instanzen im Satz gesamt (default 8)
-        max_instances_per_category: Maximale Instanzen pro Kategorie (default 3)
-        max_categories: Maximale Anzahl Kategorien zu beruecksichtigen (default 6)
-        db_path: Pfad zur DuckDB Datenbank (optional, wird von H3Engine uebernommen)
-        matrix_path: Pfad zur B1 Matrix CSV (optional, default: data/association_results/b1_matrix.csv)
+        assoc_threshold: Minimaler B1-Wert fuer relevante Kategorien
+        max_instances: Maximale Anzahl Instanzen im Satz gesamt
+        max_instances_per_category: Maximale Instanzen pro Kategorie
+        max_categories: Maximale Anzahl Kategorien zu beruecksichtigen
+        target_dataset: Dataset-Name des Target-Datensatzes
+        static_datasets: Liste von statischen Kontext-Datasets
+        db_path: Pfad zur DuckDB Datenbank (optional)
+        matrix_path: Pfad zur B1 Matrix CSV (optional)
         category_separator: Trennzeichen zwischen Kategorien im Satz
         instance_separator: Trennzeichen zwischen Instanzen einer Kategorie
     """
@@ -29,6 +45,10 @@ class SentenceGeneratorConfig:
     max_instances: int = 10
     max_instances_per_category: int = 5
     max_categories: int = 6
+
+    # Dataset settings
+    target_dataset: str = "swissnames3d"
+    static_datasets: List[StaticDatasetConfig] = field(default_factory=list)
 
     # Paths
     db_path: Optional[Path] = None

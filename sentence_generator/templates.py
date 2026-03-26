@@ -1,32 +1,27 @@
 """
 Satz-Templates und Formatierung.
+
+Format mit Static Context:
+    {OBJEKTART} "{NAME}" in {Static1} ({Label1}), {Static2} ({Label2}). Bei {Inst1} ({Kat1}); ...
+
+Beispiel:
+    Alpiner Gipfel "Matterhorn" in Zermatt (Gemeinde), Wallis (Kanton). Bei Zmuttgrat (Grat); Theodulstrasse (Strasse)
 """
 
-from typing import Dict, List, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .config import SentenceGeneratorConfig
 
 
 class SentenceTemplate:
-    """Formatiert Features und Kontext zu beschreibenden Saetzen.
-
-    Format:
-        {OBJEKTART} "{NAME}" bei {Instanz1}, {Instanz2} ({Kategorie1}); {Instanz3} ({Kategorie2}); ...
-
-    Beispiel:
-        Alpiner Gipfel "Matterhorn" bei Zmuttgrat, Hoernligrat (Grat); Theodulstrasse (Strasse)
-    """
+    """Formatiert Features und Kontext zu beschreibenden Saetzen."""
 
     def __init__(self, config: "SentenceGeneratorConfig"):
         self.config = config
 
     def format_feature(self, name: str, objektart: str) -> str:
         """Formatiert das Haupt-Feature.
-
-        Args:
-            name: Feature-Name (kann None sein)
-            objektart: OBJEKTART des Features
 
         Returns:
             Formatierter String wie 'Alpiner Gipfel "Matterhorn"'
@@ -42,10 +37,6 @@ class SentenceTemplate:
     ) -> str:
         """Formatiert eine Gruppe von Instanzen einer Kategorie.
 
-        Args:
-            objektart: OBJEKTART der Instanzen
-            instance_names: Liste der Instanz-Namen
-
         Returns:
             Formatierter String wie 'Zmuttgrat, Hoernligrat (Grat)'
         """
@@ -59,32 +50,47 @@ class SentenceTemplate:
         self,
         name: str,
         objektart: str,
-        context_by_category: Dict[str, List[str]]
+        static_context: Optional[Dict[str, List[str]]] = None,
+        context_by_category: Optional[Dict[str, List[str]]] = None,
     ) -> str:
         """Baut den kompletten beschreibenden Satz.
 
         Args:
             name: Name des Haupt-Features
             objektart: OBJEKTART des Haupt-Features
-            context_by_category: Dict von {OBJEKTART: [Namen]} fuer Kontext
+            static_context: Dict von {Label: [Namen]} fuer statischen Kontext
+                            z.B. {'Gemeinde': ['Zermatt'], 'Kanton': ['Wallis']}
+            context_by_category: Dict von {OBJEKTART: [Namen]} fuer dynamischen Kontext
 
         Returns:
-            Kompletter Satz wie 'Alpiner Gipfel "Matterhorn" bei Zmuttgrat (Grat); ...'
+            Kompletter Satz, z.B.:
+            'Alpiner Gipfel "Matterhorn" in Zermatt (Gemeinde). Bei Zmuttgrat (Grat)'
         """
-        # Feature selbst
         feature_part = self.format_feature(name, objektart)
 
-        # Kontext-Teile sammeln
-        context_parts = []
-        for cat_objektart, names in context_by_category.items():
-            if names:
-                formatted = self.format_category_group(cat_objektart, names)
-                if formatted:
-                    context_parts.append(formatted)
+        parts = []
 
-        # Zusammenbauen
-        if not context_parts:
+        # Static Context: "in Zermatt (Gemeinde), Wallis (Kanton)"
+        if static_context:
+            static_items = []
+            for label, names in static_context.items():
+                for n in names:
+                    static_items.append(f"{n} ({label})")
+            if static_items:
+                parts.append("in " + self.config.instance_separator.join(static_items))
+
+        # Dynamic Context: "bei Zmuttgrat (Grat); Theodulstrasse (Strasse)"
+        if context_by_category:
+            dynamic_items = []
+            for cat_objektart, names in context_by_category.items():
+                if names:
+                    formatted = self.format_category_group(cat_objektart, names)
+                    if formatted:
+                        dynamic_items.append(formatted)
+            if dynamic_items:
+                parts.append("bei " + self.config.category_separator.join(dynamic_items))
+
+        if not parts:
             return feature_part
 
-        context_str = self.config.category_separator.join(context_parts)
-        return f"{feature_part} bei {context_str}"
+        return feature_part + " " + ". ".join(parts)
