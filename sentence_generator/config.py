@@ -27,8 +27,8 @@ class SentenceGeneratorConfig:
 
     Attributes:
         assoc_threshold: Minimaler B1-Wert fuer relevante Kategorien
-        max_instances: Maximale Anzahl Instanzen im Satz gesamt
-        max_instances_per_category: Maximale Instanzen pro Kategorie
+        max_slots: Maximale Anzahl Slots (distinct UUIDs) im Satz gesamt
+        max_slots_per_category: Maximale Slots (distinct UUIDs) pro Kategorie
         max_categories: Maximale Anzahl Kategorien zu beruecksichtigen
         target_dataset: Dataset-Name des Target-Datensatzes
         static_datasets: Liste von statischen Kontext-Datasets
@@ -39,16 +39,17 @@ class SentenceGeneratorConfig:
     """
 
     # Association thresholds
-    assoc_threshold: float = 0.0
+    assoc_threshold: float = 0.001
 
-    # Slot allocation
-    max_instances: int = 10
-    max_instances_per_category: int = 5
-    max_categories: int = 6
-    max_filler_slots: int = 2
+    # Slot allocation (Slots zaehlen nach distinct UUIDs, nicht Einzelinstanzen)
+    max_slots: int = 10
+    max_slots_per_category: int = 5
+    max_categories: int = 10
+    max_filler_slots: int = 0
 
     # Dataset settings
     target_dataset: str = "swissnames3d"
+    uuid_field: str = "UUID"
     static_datasets: List[StaticDatasetConfig] = field(default_factory=list)
 
     # Paths

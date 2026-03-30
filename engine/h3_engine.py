@@ -650,7 +650,7 @@ class H3Engine:
                 UNION
                 SELECT feature_id FROM finer_matches
             )
-            SELECT DISTINCT f.feature_id, f.NAME, f.OBJEKTART, f.dataset
+            SELECT DISTINCT f.feature_id, f.NAME, f.OBJEKTART, f.dataset, f.UUID
             FROM all_matches m
             JOIN features f ON m.feature_id = f.feature_id
             WHERE {where_clause}

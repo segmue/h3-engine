@@ -189,11 +189,12 @@ class CandidateSentenceGenerator:
         used_feature_ids: list[int] = []
 
         if associated:
-            # 2. Slots proportional verteilen
+            # 2. Initiale Slots proportional verteilen
             slot_allocation = self._allocate_slots(associated)
 
-            # 3. EINE Query fuer alle Kategorien via h3_lookup Index
-            objektart_list = list(slot_allocation.keys())
+            # 3. ALLE assoziierten Kategorien abfragen (auch jene mit 0 Slots,
+            #    da ungenutzte Slots umverteilt werden koennen)
+            objektart_list = [cat for cat, _ in associated]
             try:
                 results_df = self.engine.find_intersecting_features(
                     feature_id=feature.feature_id,
@@ -204,26 +205,36 @@ class CandidateSentenceGenerator:
             except Exception:
                 results_df = None
 
-            # 4. Ergebnisse nach OBJEKTART gruppieren + Slot-Limits anwenden
+            # 4. Ergebnisse befuellen + ungenutzte Slots umverteilen
+            #    Slots zaehlen nach distinct UUIDs, alle Sprachvarianten mitnehmen
             if results_df is not None and not results_df.empty:
-                for objektart, slots in slot_allocation.items():
-                    if slots == 0:
-                        continue
+                remaining_slots = self.config.max_slots
+                max_per_cat = self.config.max_slots_per_category
+                uuid_field = self.config.uuid_field
+
+                for objektart, _ in associated:
+                    if remaining_slots <= 0:
+                        break
+                    slots = min(max_per_cat, remaining_slots)
+
                     mask = results_df["OBJEKTART"] == objektart
                     cat_df = results_df[mask]
                     if not cat_df.empty:
-                        selected = cat_df.head(slots)
+                        # Distinct UUIDs ermitteln, bis Slot-Limit erreicht
+                        unique_uuids = cat_df[uuid_field].unique()[:slots]
+                        selected = cat_df[cat_df[uuid_field].isin(unique_uuids)]
                         names = selected["NAME"].tolist()
                         if names:
                             context_by_category[objektart] = names
                             used_feature_ids.extend(selected["feature_id"].tolist())
+                            remaining_slots -= len(unique_uuids)
 
         # 5. Verbleibende Slots mit kleinsten intersecting Features auffuellen
         filler_by_category: Dict[str, List[str]] = {}
         used_slots = sum(len(names) for names in context_by_category.values())
         remaining_slots = min(
             self.config.max_filler_slots,
-            self.config.max_instances - used_slots,
+            self.config.max_slots - used_slots,
         )
 
         if remaining_slots > 0:
@@ -261,8 +272,8 @@ class CandidateSentenceGenerator:
         if not associated:
             return {}
 
-        total_slots = self.config.max_instances
-        max_per_cat = self.config.max_instances_per_category
+        total_slots = self.config.max_slots
+        max_per_cat = self.config.max_slots_per_category
 
         total_weight = sum(b1 for _, b1 in associated)
         if total_weight <= 0:
